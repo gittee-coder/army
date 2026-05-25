@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Auditor 审一个 PR：只读 review + 安全扫，结论评论回 PR；不改代码、不合并（SoD）。
+# 用法：army-run-auditor <project> <pr-number> [issue] [model]   （model 默认 sonnet）
+#
+# SoD 由 allowlist 兜底：只给 Bash/Read/Grep/Glob，【不给 Edit/Write】→ 结构上改不了代码。
+# "不合并" 靠 roles/auditor.md 软约束（合并是 pyf 审批；红线 hard hook 见 spec §9 步骤5）。
+set -euo pipefail
+proj="${1:?用法: army-run-auditor <project> <pr> [issue] [model]}"
+pr="${2:?需要 PR number}"
+issue="${3:-}"
+model="${4:-sonnet}"
+~/army/bin/army-guard || exit 0
+
+read -r path repo < <(python3 - "$proj" <<'PY'
+import sys, os, yaml, pathlib
+proj = sys.argv[1]
+d = yaml.safe_load(pathlib.Path(os.path.expanduser("~/army/projects.yaml")).read_text())
+p = d["projects"][proj]
+print(os.path.expanduser(p["path"]), p.get("repo") or "")
+PY
+)
+[[ -n "${path:-}" && -d "$path" ]] || { echo "未知/无效项目: $proj ($path)"; exit 1; }
+
+prompt="审查 PR #$pr（仓 $repo${issue:+，声称 Closes #$issue}）。
+1) \`gh pr view $pr --repo $repo\` + \`gh pr diff $pr --repo $repo\` 看改动，对照它要修的问题。
+2) 审：修复是否正确、是否最小化、有无副作用/回归、安全（无注入/泄密/越权/误删）。
+3) 结论用 \`gh pr comment $pr --repo $repo --body \"...\"\` 写回（**用 comment，不要 review --approve**，因作者同账号会被 GitHub 拒）：
+   通过写「✅ LGTM」+ 理由；有问题写「⚠️」+ 逐条列出。
+SoD 铁律：你【只读】——不改任何代码、不 merge PR（合并是 pyf 的审批）。"
+
+start=$(date +%s); cd "$path"
+set +e
+claude -p "$prompt" \
+  --append-system-prompt "$(cat ~/army/roles/auditor.md)" \
+  --permission-mode default \
+  --model "$model" \
+  --allowedTools Bash Read Grep Glob
+rc=$?; set -e
+dur=$(( $(date +%s) - start ))
+~/army/bin/army-ledger --role auditor ${issue:+--issue "$issue"} --duration "$dur" \
+  --result "$([[ $rc -eq 0 ]] && echo ok || echo fail)" --task "review $repo PR#$pr ($proj)" >/dev/null
+echo "=== auditor done: rc=$rc dur=${dur}s ==="

@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Dispatcher poller —— 编排循环 §9 步骤1 骨架。
+
+扫各注册项目（projects.yaml 里有 repo 的）的 `auto-eligible` 开放 Issue，
+发现【未分诊】（无 `army/triaged` 标）的 → 唤起 PM。
+
+骨架安全阀：默认 **DRY**（只 gh 查 + 记日志，不真起 PM，避免烧 token）；
+            `ARMY_DISPATCH_LIVE=1` 才真 headless 唤起 PM。
+总开关：`~/.army-state` = PAUSE 时直接退。
+"""
+import os, sys, json, subprocess, datetime, pathlib
+
+ARMY = pathlib.Path(os.path.expanduser("~/army"))
+LOG = pathlib.Path(os.path.expanduser(os.environ.get("ARMY_LOG_DIR", str(ARMY / "log")))) / "dispatch.log"
+GH = os.environ.get("GH_BIN", "gh")
+LIVE = os.environ.get("ARMY_DISPATCH_LIVE") == "1"
+
+
+def log(msg):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{datetime.datetime.now().isoformat(timespec='seconds')} {msg}"
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+    print(line)
+
+
+def guard():
+    state = pathlib.Path(os.path.expanduser(os.environ.get("ARMY_STATE", "~/.army-state")))
+    try:
+        if state.read_text().strip() == "PAUSE":
+            log("PAUSED — skip")
+            sys.exit(0)
+    except FileNotFoundError:
+        pass
+
+
+def load_repos():
+    import yaml
+    data = yaml.safe_load((ARMY / "projects.yaml").read_text()) or {}
+    out = []
+    for name, p in (data.get("projects") or {}).items():
+        repo = (p or {}).get("repo")
+        if isinstance(repo, str) and repo and not repo.startswith("<"):
+            out.append((name, repo))
+    return out
+
+
+def gh_env(repo):
+    # gh CLI uses its own stored auth. If a repo needs a different/org-scoped
+    # token, export GH_TOKEN in the environment before running the dispatcher.
+    return dict(os.environ)
+
+
+def list_untriaged(repo):
+    r = subprocess.run(
+        [GH, "issue", "list", "--repo", repo, "--label", "auto-eligible",
+         "--state", "open", "--json", "number,title,labels"],
+        capture_output=True, text=True, env=gh_env(repo))
+    if r.returncode != 0:
+        log(f"[{repo}] gh error: {r.stderr.strip()[:200]}")
+        return []
+    issues = json.loads(r.stdout or "[]")
+    return [it for it in issues
+            if "army/triaged" not in {l["name"] for l in it.get("labels", [])}]
+
+
+def wake_pm(repo, issue):
+    n, title = issue["number"], issue["title"]
+    if not LIVE:
+        log(f"[DRY] would wake PM for {repo}#{n}: {title}")
+        return
+    log(f"[LIVE] waking PM for {repo}#{n}")
+    subprocess.run(["bash", "-lc",
+        'cd ~/army && claude -p --append-system-prompt "$(cat ~/army/roles/pm.md)" '
+        f'--model opus "触发：{repo} 新 Issue #{n} 待分诊。读它、决定接不接、'
+        f'接则拆解派工并打 army/triaged 标。"'])
+
+
+def main():
+    guard()
+    repos = load_repos()
+    log(f"poll start — {len(repos)} repo(s): {[r for _, r in repos]} (LIVE={LIVE})")
+    total = 0
+    for _name, repo in repos:
+        for issue in list_untriaged(repo):
+            wake_pm(repo, issue)
+            total += 1
+    log(f"poll done — {total} issue(s) needing PM")
+
+
+if __name__ == "__main__":
+    main()

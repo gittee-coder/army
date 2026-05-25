@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# 唤起 PM 分诊并派工一个 Issue（事件式：triage → 接则调 army-run-worker）。
+# 用法：army-run-pm <project> <issue> [worker-model]   （worker model 默认 opus）
+#
+# PM allowlist 只 Bash/Read/Grep/Glob（无 Edit/Write，不亲自改代码）；cwd=~/army 自动加载 CLAUDE.md。
+# Auditor 由 dispatcher 另行触发（PM 不链 auditor）。
+set -euo pipefail
+proj="${1:?用法: army-run-pm <project> <issue> [worker-model]}"
+issue="${2:?需要 issue number}"
+wmodel="${3:-opus}"
+~/army/bin/army-guard || exit 0
+
+read -r path repo < <(python3 - "$proj" <<'PY'
+import sys, os, yaml, pathlib
+proj = sys.argv[1]
+d = yaml.safe_load(pathlib.Path(os.path.expanduser("~/army/projects.yaml")).read_text())
+p = d["projects"][proj]
+print(os.path.expanduser(p["path"]), p.get("repo") or "")
+PY
+)
+[[ -n "${repo:-}" ]] || { echo "项目 $proj 无 repo（research 画像走别的路）"; exit 1; }
+gh label create army/triaged --repo "$repo" --color fbca04 --description "PM 已分诊" 2>/dev/null || true
+
+prompt="你是 PM，处理 $repo 的 Issue #$issue（项目 $proj）。
+1) \`gh issue view $issue --repo $repo\` 读它。
+2) 分诊：军团能否接、是否清晰可执行。不接/信息不足 → \`gh issue comment $issue --repo $repo --body ...\` 说明原因，不派工，结束。
+3) 接 → \`gh issue edit $issue --repo $repo --add-label army/triaged\`，再派 worker：
+   \`~/army/bin/army-run-worker $proj $issue $wmodel\`（建 worktree + 起 worker + 开 PR；琐碎活可把 model 换 sonnet）。
+4) 报告 worker 开的 PR 号 + 一句结论；记 ledger：
+   \`~/army/bin/army-ledger --role pm --issue $issue --result ok --task \"triage+dispatch $repo#$issue\"\`。
+铁律：不亲自改代码、不合并 PR（合并是 pyf 审批）。Auditor 由 dispatcher 另行触发，你不用管。"
+
+start=$(date +%s); cd ~/army
+set +e
+claude -p "$prompt" \
+  --append-system-prompt "$(cat ~/army/roles/pm.md)" \
+  --permission-mode default \
+  --model opus \
+  --allowedTools Bash Read Grep Glob
+rc=$?; set -e
+echo "=== PM done: rc=$rc dur=$(( $(date +%s) - start ))s ==="

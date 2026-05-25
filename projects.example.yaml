@@ -1,0 +1,35 @@
+# 项目注册表（示例）—— 复制为 projects.yaml 并按你的项目填。
+# 派发器/唤起脚本按任务的 project 标签查这里，解析「工作路径 / repo / 工具链 / worker 画像」。
+# 切项目 = 换 worker 的 --cwd（每任务参数），不是全局锁。每个项目的 CLAUDE.md 随 cwd 自动加载。
+#
+# worker_type:
+#   code     —— PR-to-merge：开分支 → 改 → 测 → 开 PR → Auditor review → 审批合并
+#   media    —— 产物落盘 + 关键节点审批（非 PR 模型）
+#   research —— 文件级改 + 报告/ledger（无 git repo 时无 PR 流）
+
+projects:
+  # —— 真实跑通过的样例：一个前端项目（推 main 即 CI 部署）——
+  cue:
+    department: software
+    worker_type: code
+    path: ~/code/cue
+    repo: your-org/cue            # 形如 owner/name；gh 用其自身 auth（org 仓可 export GH_TOKEN）
+    test: "npm run test"
+    worktree_base: ~/army/worktrees/cue
+
+  # —— 模板：另一个 code 项目 ——
+  example-app:
+    department: software
+    worker_type: code
+    path: ~/code/example-app
+    repo: your-org/example-app
+    test: "make test"
+    worktree_base: ~/army/worktrees/example-app
+
+  # —— 模板：research 画像（无 git repo → 走文件级改 + ledger，无 PR 流）——
+  example-research:
+    department: research
+    worker_type: research
+    path: ~/work/example-research
+    repo: null
+    notes: 未 git init → 无 PR 流；想要 PR 流先 init + 建 repo，再改 worker_type=code

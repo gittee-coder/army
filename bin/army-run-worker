@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# 派一个 code worker 干某 Issue：建 worktree（基于最新 origin/main）+ 起 headless worker + 记 ledger。
+# 用法：army-run-worker <project> <issue-number> [model]   （model 默认 opus）
+#
+# worker 跑法：acceptEdits + allowlist(Bash/Edit/Write/Read/Grep/Glob)，靠 roles/worker.md 软约束
+# （不 push main、开 PR）。注：红线 hard hook（spec §9 步骤5）尚未挂，首批靠 role 手册 + PR 门 + 人审兜底。
+set -euo pipefail
+proj="${1:?用法: army-run-worker <project> <issue> [model]}"
+issue="${2:?需要 issue number}"
+model="${3:-opus}"
+~/army/bin/army-guard || exit 0
+
+read -r path repo < <(python3 - "$proj" <<'PY'
+import sys, os, yaml, pathlib
+proj = sys.argv[1]
+d = yaml.safe_load(pathlib.Path(os.path.expanduser("~/army/projects.yaml")).read_text())
+p = d["projects"][proj]
+print(os.path.expanduser(p["path"]), p.get("repo") or "")
+PY
+)
+[[ -n "${path:-}" && -d "$path" ]] || { echo "未知/无效项目: $proj ($path)"; exit 1; }
+
+branch="army/issue-$issue"
+wt="$HOME/army/worktrees/$proj/issue-$issue"
+
+git -C "$path" fetch origin --quiet || true
+[[ -d "$wt" ]] || git -C "$path" worktree add "$wt" -b "$branch" origin/main 2>/dev/null \
+  || git -C "$path" worktree add "$wt" -b "$branch"
+
+prompt="任务 Issue #$issue（仓 $repo）。先 \`gh issue view $issue --repo $repo\` 读描述，定位并修复。
+完成后：跑 \`npm run build\`（必要时先 \`npm install\`）确认不破；在分支 $branch commit；
+\`gh pr create --repo $repo --base main --head $branch\` 开 PR，body 写 Closes #$issue。
+铁律：绝不 push 到 main/master；只在本分支开 PR。"
+
+start=$(date +%s); cd "$wt"
+set +e
+claude -p "$prompt" \
+  --append-system-prompt "$(cat ~/army/roles/worker.md)" \
+  --permission-mode acceptEdits \
+  --model "$model" \
+  --allowedTools Bash Edit Write Read Grep Glob
+rc=$?; set -e
+dur=$(( $(date +%s) - start ))
+~/army/bin/army-ledger --role worker --issue "$issue" --duration "$dur" \
+  --result "$([[ $rc -eq 0 ]] && echo ok || echo fail)" --task "fix $repo#$issue ($proj)" >/dev/null
+echo "=== worker done: rc=$rc dur=${dur}s — worktree $wt ==="

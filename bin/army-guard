@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# 总开关。RUN → exit 0（放行）；PAUSE → exit 3（调用方应自行 skip）。
+# 用法（每个 army 任务/systemd 服务启动第一行）：
+#   ~/army/bin/army-guard || exit 0
+# 紧急停军团：  echo PAUSE > ~/.army-state
+# 恢复：        echo RUN   > ~/.army-state   （或删掉该文件）
+state_file="${ARMY_STATE:-$HOME/.army-state}"
+state="$(cat "$state_file" 2>/dev/null || echo RUN)"
+if [[ "$state" == "PAUSE" ]]; then
+  echo "[army-guard] PAUSED ($state_file) — skip" >&2
+  exit 3
+fi
+exit 0

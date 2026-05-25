@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# 执行账本：每次 agent 跑完追加一行 JSON 到 runs.jsonl。
+# 用法：army-ledger --role pm --task "扫 lotus bug" [--issue 123] \
+#                   [--duration 42] [--tokens 1500] [--files "a.ts,b.ts"] [--result ok]
+set -euo pipefail
+ledger="${ARMY_LEDGER:-$HOME/army/runs.jsonl}"
+mkdir -p "$(dirname "$ledger")"
+role=""; task=""; issue=""; duration=""; tokens=""; files=""; result=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --role) role="$2"; shift 2;;
+    --task) task="$2"; shift 2;;
+    --issue) issue="$2"; shift 2;;
+    --duration) duration="$2"; shift 2;;
+    --tokens) tokens="$2"; shift 2;;
+    --files) files="$2"; shift 2;;
+    --result) result="$2"; shift 2;;
+    -h|--help) grep '^#' "$0" | sed 's/^# \?//'; exit 0;;
+    *) echo "unknown arg: $1" >&2; exit 2;;
+  esac
+done
+python3 - "$ledger" "$role" "$task" "$issue" "$duration" "$tokens" "$files" "$result" <<'PY'
+import json, sys, datetime
+ledger, role, task, issue, duration, tokens, files, result = sys.argv[1:9]
+rec = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+       "role": role, "task": task}
+if issue:    rec["issue"] = int(issue) if issue.isdigit() else issue
+if duration: rec["duration_s"] = float(duration)
+if tokens:   rec["tokens"] = int(tokens)
+if files:    rec["files_touched"] = [f for f in files.split(",") if f]
+if result:   rec["result"] = result
+with open(ledger, "a") as fh:
+    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+print(json.dumps(rec, ensure_ascii=False))
+PY

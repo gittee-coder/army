@@ -1,0 +1,14 @@
+# 运行时状态（每个使用者本地生成，不入库）
+projects.yaml
+runs.jsonl
+worktrees/
+log/
+.army-state
+
+# 知识库（操作者自己的独立 repo，不随本脚手架分发）
+pyf-docs/
+
+# 杂项
+.DS_Store
+*.log
+__pycache__/
