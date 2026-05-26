@@ -5,8 +5,13 @@ worktrees/
 log/
 .army-state
 
-# 知识库（操作者自己的独立 repo，不随本脚手架分发）
-pyf-docs/
+# 知识库 / 私有产物（操作者自己的独立 repo，不随本脚手架分发）
+docs-private/
+dashboard/
+
+# 凭据（绝不入库）
+.army/
+*.env
 
 # 杂项
 .DS_Store

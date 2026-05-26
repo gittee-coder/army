@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# 出口探活。全军出口吊在 Windows 宿主代理上，它一挂全员断 Claude API。
+# 出口探活。全军出口吊在宿主机代理上，它一挂全员断 Claude API。
 # 这里只探（curl api.anthropic.com）+ 记日志：
 #   - 能到 Anthropic（任何 HTTP 码，含 401/405）→ OK
 #   - 连不上（curl 失败，码=000）→ DOWN，退出码 1
-# 重启动作在 Windows 侧（WSL 够不着）→ 后续接 Telegram 报警 / Windows 自愈 Task。
+# DOWN 时推 IM 告警（feishu-notify，未配 webhook 则 no-op）；重启动作在宿主侧（WSL 够不着）。
 log="${ARMY_LOG_DIR:-$HOME/army/log}/watchdog.log"
 mkdir -p "$(dirname "$log")"
 ts="$(date -Iseconds)"
 code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' https://api.anthropic.com/v1/messages 2>/dev/null || echo 000)"
 if [[ "$code" == "000" ]]; then
-  echo "$ts DOWN (code=$code) — Windows 侧代理可能挂了，全军断 API" | tee -a "$log" >&2
+  echo "$ts DOWN (code=$code) — 宿主侧代理可能挂了，全军断 API" | tee -a "$log" >&2
+  "$HOME/army/bin/feishu-notify" --title "军团出口 DOWN" \
+    "$ts api.anthropic.com 不可达，宿主侧代理可能挂了 → 全军断 Claude API，去宿主侧重启代理。" 2>/dev/null || true
   exit 1
 fi
 echo "$ts OK (code=$code)" >> "$log"

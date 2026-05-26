@@ -1,0 +1,13 @@
+{
+  "$comment": "army worker 红线 hook 注入。army-run-worker 经 claude --settings 加载。默认 LOG-ONLY；切真拦：在 worker 环境设 ARMY_REDLINE_ENFORCE=1。源 spec: docs/red-lines-spec.md。注意：command 须为绝对路径，把下面 $HOME 换成你的实际家目录（如 /home/you/army/bin/army-redline-hook）。",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "$HOME/army/bin/army-redline-hook" }
+        ]
+      }
+    ]
+  }
+}

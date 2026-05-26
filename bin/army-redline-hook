@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""红线 PreToolUse hook —— red-lines-spec.md 的编译产物。
+
+硬约束 > 软约束：在工具执行【前】用确定性 regex 拦掉 RED 操作，不靠 LLM "记得别这么干"。
+Claude Code 经 worker 的 --settings 注入（hooks/worker-settings.json）；匹配 Bash / Edit / Write / NotebookEdit。
+
+两档模式（docs/red-lines-spec.md「上线策略」：第一周只 log 不拦）：
+  默认                    —— LOG-ONLY：命中只写 log + ledger，永远放行（exit 0）。
+  ARMY_REDLINE_ENFORCE=1  —— ENFORCE：命中 RED 输出 deny 决策，确定性拦截。
+
+stdin：PreToolUse hook 事件 JSON（tool_name / tool_input）。
+stdout：放行时空；ENFORCE 拦截时输出 permissionDecision=deny 的 hookSpecificOutput。
+
+可配置：ARMY_SITE_REPO —— 受保护的站点仓目录名（默认 "site"），用于「≥10MB 二进制提进站点仓」规则。
+"""
+import sys, os, json, re, datetime, pathlib, subprocess
+
+ARMY = pathlib.Path(os.path.expanduser("~/army"))
+LOG = pathlib.Path(os.environ.get("ARMY_LOG_DIR", str(ARMY / "log"))) / "redline.log"
+LEDGER = ARMY / "bin" / "army-ledger"
+ENFORCE = os.environ.get("ARMY_REDLINE_ENFORCE") == "1"
+# 受保护的站点仓（Pages 类，禁大二进制）。泛化为 env，默认 "site"；与你的站点仓目录名对齐。
+SITE_REPO = os.environ.get("ARMY_SITE_REPO", "site")
+
+# RED — 永远人 ack（硬拦）。每条：(规则名, 适用工具集, 命中判定函数)。
+# 只编码确定性可判的；不可由命令文本确定的留给 PR 门 + 人审。
+RED_RULES = [
+    ("git push 到 main/master",
+     {"Bash"},
+     lambda cmd, fp: bool(re.search(r"git\s+push\b", cmd) and
+                          re.search(r"\b(main|master|HEAD:main|HEAD:master)\b", cmd)
+                          and not re.search(r":\s*army/|army/\S+\s*$", cmd))),
+    ("git force-push（必审批）",
+     {"Bash"},
+     lambda cmd, fp: bool(re.search(r"git\s+push\b.*(--force\b|--force-with-lease\b|(^|\s)-f(\s|$))", cmd))),
+    # 只命中真·凭据文件，不碰源码里带 token/secret 字样的文件名（如 tokenStore.ts），避免 ENFORCE 误伤卡死流水线。
+    # 也放行 .env.example/sample/template/dist 模板。
+    ("改 .env / 密钥凭据文件",
+     {"Edit", "Write", "NotebookEdit"},
+     lambda cmd, fp: bool(re.search(
+         r"(^|/)\.env$|(^|/)\.env\.(?!example|sample|template|dist)[\w.-]+$|"
+         r"(^|/)secrets?\.(json|ya?ml|env|txt|toml)$|"
+         r"(^|/)credentials?(\.(json|ya?ml|ini|txt))?$|\.pem$|(^|/)id_(rsa|ed25519|ecdsa)\b|"
+         r"(^|/)\.(netrc|npmrc|git-credentials|pypirc)$|\.p12$|\.pfx$|\.keystore$", fp, re.I))),
+    ("Bash 写/删 .env / 密钥凭据文件",
+     {"Bash"},
+     lambda cmd, fp: bool(re.search(
+         r"(rm|mv|cp|tee)\b[^|;&]*?(\s|/)(\.env(\.(?!example|sample|template|dist)[\w.-]+)?\b|"
+         r"\.pem\b|id_(rsa|ed25519|ecdsa)\b|\.(netrc|git-credentials|pypirc)\b)|"
+         r">\s*\S*\.env(\.(?!example|sample|template|dist)[\w.-]+)?\b", cmd, re.I))),
+    ("≥10MB 视频/二进制提进站点仓",
+     {"Bash"},
+     lambda cmd, fp: bool(re.search(r"git\s+add\b", cmd) and SITE_REPO in cmd and
+                          re.search(r"\.(mp4|mov|webm|mkv|avi|zip|tar|gz|psd|wav)\b", cmd, re.I))),
+    ("删 prod 资源（rm -rf 危险路径）",
+     {"Bash"},
+     lambda cmd, fp: bool(re.search(r"rm\s+-rf?\b.*(/|\$HOME|~)\S*(prod|production|/var/www|/etc)\b", cmd))),
+]
+
+
+def extract(tool_name, ti):
+    """返回 (command_text, file_path_text) 供 regex 用。"""
+    cmd = ti.get("command", "") if isinstance(ti, dict) else ""
+    fp = ""
+    if isinstance(ti, dict):
+        fp = ti.get("file_path") or ti.get("notebook_path") or ti.get("path") or ""
+    return cmd or "", fp or ""
+
+
+def main():
+    try:
+        evt = json.load(sys.stdin)
+    except Exception:
+        sys.exit(0)  # 读不到事件就放行，绝不因 hook 自身故障卡死流水线
+
+    tool = evt.get("tool_name", "")
+    cmd, fp = extract(tool, evt.get("tool_input", {}))
+
+    hits = [name for name, tools, test in RED_RULES
+            if tool in tools and _safe(test, cmd, fp)]
+    if not hits:
+        sys.exit(0)
+
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    mode = "ENFORCE" if ENFORCE else "LOG-ONLY"
+    detail = (cmd or fp)[:300]
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{ts} [{mode}] RED hit ({tool}): {hits} :: {detail}\n")
+    _ledger(hits, tool, detail)
+
+    if ENFORCE:
+        reason = f"红线拦截 RED：{'; '.join(hits)}。需人工 ack —— 见 docs/red-lines-spec.md。"
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }}))
+        sys.exit(0)
+    # LOG-ONLY：放行
+    sys.exit(0)
+
+
+def _safe(test, cmd, fp):
+    try:
+        return bool(test(cmd, fp))
+    except Exception:
+        return False
+
+
+def _ledger(hits, tool, detail):
+    try:
+        subprocess.run([str(LEDGER), "--role", "redline", "--result",
+                        ("deny" if ENFORCE else "warn"),
+                        "--task", f"RED {hits} ({tool}): {detail[:120]}"],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()

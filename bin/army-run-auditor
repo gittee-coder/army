@@ -3,7 +3,7 @@
 # 用法：army-run-auditor <project> <pr-number> [issue] [model]   （model 默认 sonnet）
 #
 # SoD 由 allowlist 兜底：只给 Bash/Read/Grep/Glob，【不给 Edit/Write】→ 结构上改不了代码。
-# "不合并" 靠 roles/auditor.md 软约束（合并是 pyf 审批；红线 hard hook 见 spec §9 步骤5）。
+# "不合并" 靠 roles/auditor.md 软约束（合并是人审批；红线 hard hook 见 docs/red-lines-spec.md）。
 set -euo pipefail
 proj="${1:?用法: army-run-auditor <project> <pr> [issue] [model]}"
 pr="${2:?需要 PR number}"
@@ -20,23 +20,41 @@ print(os.path.expanduser(p["path"]), p.get("repo") or "")
 PY
 )
 [[ -n "${path:-}" && -d "$path" ]] || { echo "未知/无效项目: $proj ($path)"; exit 1; }
+# gh 用其自身 auth；org 仓如需 org-scoped token，运行本脚本前 export GH_TOKEN。
 
 prompt="审查 PR #$pr（仓 $repo${issue:+，声称 Closes #$issue}）。
 1) \`gh pr view $pr --repo $repo\` + \`gh pr diff $pr --repo $repo\` 看改动，对照它要修的问题。
 2) 审：修复是否正确、是否最小化、有无副作用/回归、安全（无注入/泄密/越权/误删）。
 3) 结论用 \`gh pr comment $pr --repo $repo --body \"...\"\` 写回（**用 comment，不要 review --approve**，因作者同账号会被 GitHub 拒）：
-   通过写「✅ LGTM」+ 理由；有问题写「⚠️」+ 逐条列出。
-SoD 铁律：你【只读】——不改任何代码、不 merge PR（合并是 pyf 的审批）。"
+   通过写「LGTM」+ 理由；有问题写「CHANGES」+ 逐条列出。
+SoD 铁律：你【只读】——不改任何代码、不 merge PR（合并是人的审批）。
+4) 最后**单独一行**输出机器可读裁决：通过写 \`VERDICT=LGTM\`，需要改写 \`VERDICT=CHANGES\`。"
 
 start=$(date +%s); cd "$path"
 set +e
-claude -p "$prompt" \
+out=$(claude -p "$prompt" \
   --append-system-prompt "$(cat ~/army/roles/auditor.md)" \
   --permission-mode default \
   --model "$model" \
-  --allowedTools Bash Read Grep Glob
+  --allowedTools Bash Read Grep Glob)
 rc=$?; set -e
+printf '%s\n' "$out"
 dur=$(( $(date +%s) - start ))
 ~/army/bin/army-ledger --role auditor ${issue:+--issue "$issue"} --duration "$dur" \
   --result "$([[ $rc -eq 0 ]] && echo ok || echo fail)" --task "review $repo PR#$pr ($proj)" >/dev/null
 echo "=== auditor done: rc=$rc dur=${dur}s ==="
+
+# 裁决 → 闭合"最后一拍人审"：LGTM 推 IM 审批卡片，CHANGES 通知打回。打过的 PR 加 army/audited 防重复触发。
+verdict="$(printf '%s\n' "$out" | grep -oE 'VERDICT=(LGTM|CHANGES)' | tail -1 | cut -d= -f2 || true)"
+GHB="${GH_BIN:-gh}"
+$GHB label create army/audited --repo "$repo" --color 0e8a16 --description "Auditor 已审过" 2>/dev/null || true
+$GHB pr edit "$pr" --repo "$repo" --add-label army/audited 2>/dev/null || true
+if [[ "$verdict" == "LGTM" ]]; then
+  ~/army/bin/army-approve-card "$repo" "$pr" "${issue:-}" || true
+  echo "=== LGTM → 已推 IM 审批卡片，等人点批准 ==="
+elif [[ "$verdict" == "CHANGES" ]]; then
+  ~/army/bin/feishu-send --md "**Auditor 打回** \`$repo\` PR#$pr${issue:+（Closes #$issue）}：需要修改，详见 PR 评论。" || true
+  echo "=== CHANGES → 已通知 IM ==="
+else
+  echo "=== 未解析到 VERDICT（rc=$rc）→ 不自动推卡片，人工看 PR 评论 ==="
+fi

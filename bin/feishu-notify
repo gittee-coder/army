@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""IM 单向告警 —— 军团出口/红线/任务事件推到群（飞书自定义机器人 webhook）。
+
+最小依赖路径：一个【自定义机器人】webhook 即可（群设置 → 添加机器人 → 自定义机器人）。
+凭据走 env 文件 `~/.army/im.env`（不入 git；也可直接用环境变量覆盖）：
+    FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxxx
+    FEISHU_SECRET=xxxx      # 可选；机器人开了「签名校验」才需要
+
+用法：
+    feishu-notify "文本消息"
+    echo "多行正文" | feishu-notify --title "军团告警"
+未配 webhook 时优雅 no-op（exit 0 + stderr 提示），不拖垮 watchdog 等调用方。
+
+注：这是【单向通知】。双向审批桥（互动卡片 + @PM 实时唤起）需自建应用
+    （app_id/app_secret + 事件订阅长连接），属 feishu-bridge。
+"""
+import sys, os, json, time, hashlib, hmac, base64, urllib.request, pathlib
+
+ENV = pathlib.Path(os.path.expanduser(os.environ.get("ARMY_IM_ENV", "~/.army/im.env")))
+
+
+def load_env():
+    cfg = {}
+    if ENV.exists():
+        for line in ENV.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    # 环境变量优先于文件
+    for k in ("FEISHU_WEBHOOK", "FEISHU_SECRET"):
+        if os.environ.get(k):
+            cfg[k] = os.environ[k]
+    return cfg
+
+
+def sign(secret, ts):
+    s = f"{ts}\n{secret}"
+    h = hmac.new(s.encode(), b"", hashlib.sha256).digest()
+    return base64.b64encode(h).decode()
+
+
+def main():
+    args = sys.argv[1:]
+    title = None
+    if "--title" in args:
+        i = args.index("--title")
+        title = args[i + 1]
+        del args[i:i + 2]
+    text = " ".join(args).strip() or sys.stdin.read().strip()
+    if not text:
+        print("feishu-notify: 无消息内容", file=sys.stderr)
+        sys.exit(2)
+    if title:
+        text = f"【{title}】\n{text}"
+
+    cfg = load_env()
+    hook = cfg.get("FEISHU_WEBHOOK")
+    if not hook:
+        print(f"feishu-notify: 未配 FEISHU_WEBHOOK（{ENV}）→ 跳过推送。消息：{text[:200]}",
+              file=sys.stderr)
+        sys.exit(0)  # no-op，不报错
+
+    payload = {"msg_type": "text", "content": {"text": text}}
+    if cfg.get("FEISHU_SECRET"):
+        ts = str(int(time.time()))
+        payload["timestamp"] = ts
+        payload["sign"] = sign(cfg["FEISHU_SECRET"], ts)
+
+    req = urllib.request.Request(hook, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            body = json.loads(r.read().decode() or "{}")
+        if body.get("code", 0) not in (0, None):
+            print(f"feishu-notify: 返回错误 {body}", file=sys.stderr)
+            sys.exit(1)
+        print("feishu-notify: 已推送")
+    except Exception as e:
+        print(f"feishu-notify: 推送失败 {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

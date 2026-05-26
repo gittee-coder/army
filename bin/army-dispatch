@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Dispatcher poller —— 编排循环 §9 步骤1 骨架。
+"""Dispatcher poller —— 编排循环步骤1。
 
-扫各注册项目（projects.yaml 里有 repo 的）的 `auto-eligible` 开放 Issue，
-发现【未分诊】（无 `army/triaged` 标）的 → 唤起 PM。
+扫各注册项目（projects.yaml 里有 repo 的）：
+  ① `auto-eligible` 开放 Issue 中【未分诊】（无 `army/triaged` 标）的 → 唤起 PM（army-run-pm）。
+  ② worker 开的 PR（head=army/issue-N）中【未审过】（无 `army/audited` 标）的 → 唤起 Auditor（army-run-auditor）。
 
-骨架安全阀：默认 **DRY**（只 gh 查 + 记日志，不真起 PM，避免烧 token）；
-            `ARMY_DISPATCH_LIVE=1` 才真 headless 唤起 PM。
+安全阀：默认 **DRY**（只 gh 查 + 记日志，不真起 agent，避免烧 token）；
+        `ARMY_DISPATCH_LIVE=1` 才真唤起 PM / Auditor（LIVE 路径调用 army-run-pm / army-run-auditor）。
 总开关：`~/.army-state` = PAUSE 时直接退。
+末尾常驻调用 army-dashboard-sync（按日历天节流，把作战看板同步到站点）。
 """
-import os, sys, json, subprocess, datetime, pathlib
+import os, sys, re, json, subprocess, datetime, pathlib
 
 ARMY = pathlib.Path(os.path.expanduser("~/army"))
 LOG = pathlib.Path(os.path.expanduser(os.environ.get("ARMY_LOG_DIR", str(ARMY / "log")))) / "dispatch.log"
@@ -57,35 +59,73 @@ def list_untriaged(repo):
          "--state", "open", "--json", "number,title,labels"],
         capture_output=True, text=True, env=gh_env(repo))
     if r.returncode != 0:
-        log(f"[{repo}] gh error: {r.stderr.strip()[:200]}")
+        log(f"[{repo}] gh issue error: {r.stderr.strip()[:200]}")
         return []
     issues = json.loads(r.stdout or "[]")
     return [it for it in issues
             if "army/triaged" not in {l["name"] for l in it.get("labels", [])}]
 
 
-def wake_pm(repo, issue):
+def list_pr_to_audit(repo):
+    """worker 开的 PR（head=army/issue-N）里还没被 auditor 审过（无 army/audited 标）的。"""
+    r = subprocess.run(
+        [GH, "pr", "list", "--repo", repo, "--state", "open",
+         "--json", "number,headRefName,labels"],
+        capture_output=True, text=True, env=gh_env(repo))
+    if r.returncode != 0:
+        log(f"[{repo}] gh pr error: {r.stderr.strip()[:200]}")
+        return []
+    out = []
+    for pr in json.loads(r.stdout or "[]"):
+        head = pr.get("headRefName", "")
+        labels = {l["name"] for l in pr.get("labels", [])}
+        if head.startswith("army/") and "army/audited" not in labels:
+            m = re.search(r"issue-(\d+)", head)
+            out.append((pr["number"], m.group(1) if m else ""))
+    return out
+
+
+def wake_pm(name, repo, issue):
     n, title = issue["number"], issue["title"]
     if not LIVE:
-        log(f"[DRY] would wake PM for {repo}#{n}: {title}")
+        log(f"[DRY] would wake PM: {repo}#{n} {title}")
         return
-    log(f"[LIVE] waking PM for {repo}#{n}")
-    subprocess.run(["bash", "-lc",
-        'cd ~/army && claude -p --append-system-prompt "$(cat ~/army/roles/pm.md)" '
-        f'--model opus "触发：{repo} 新 Issue #{n} 待分诊。读它、决定接不接、'
-        f'接则拆解派工并打 army/triaged 标。"'])
+    log(f"[LIVE] army-run-pm {name} {n}: {title}")
+    subprocess.run([str(ARMY / "bin" / "army-run-pm"), name, str(n)])
+
+
+def run_auditor(name, repo, pr, issue):
+    if not LIVE:
+        log(f"[DRY] would audit: {repo} PR#{pr} (issue {issue or '?'})")
+        return
+    log(f"[LIVE] army-run-auditor {name} {pr} {issue}")
+    cmd = [str(ARMY / "bin" / "army-run-auditor"), name, str(pr)]
+    if issue:
+        cmd.append(str(issue))
+    subprocess.run(cmd)
 
 
 def main():
     guard()
     repos = load_repos()
     log(f"poll start — {len(repos)} repo(s): {[r for _, r in repos]} (LIVE={LIVE})")
-    total = 0
-    for _name, repo in repos:
+    n_pm = n_audit = 0
+    for name, repo in repos:
         for issue in list_untriaged(repo):
-            wake_pm(repo, issue)
-            total += 1
-    log(f"poll done — {total} issue(s) needing PM")
+            wake_pm(name, repo, issue)
+            n_pm += 1
+        for pr, iss in list_pr_to_audit(repo):
+            run_auditor(name, repo, pr, iss)
+            n_audit += 1
+    log(f"poll done — {n_pm} issue→PM, {n_audit} PR→auditor")
+    # 每日同步作战看板到站点（按天节流，自身 no-op 多数轮询）。best-effort，失败不影响 dispatch。
+    try:
+        r = subprocess.run([str(ARMY / "bin" / "army-dashboard-sync")],
+                           capture_output=True, text=True, timeout=180)
+        if r.stdout.strip():
+            log(f"[dashboard] {r.stdout.strip()}")
+    except Exception as e:
+        log(f"[dashboard] sync 异常（忽略）：{e}")
 
 
 if __name__ == "__main__":

@@ -4,8 +4,8 @@
 #   pm                     # 进入交互对话
 #   pm "看下 cue 的 #12"    # 带首句开聊
 #
-# 这是 PM 的「本地直连」通道，和 Telegram 是【同一个 PM 角色】——都从持久层
-# (GitHub Issue/Projects + pyf-docs + runs.jsonl) 水合，看到同一个世界；不同的只是触发方式。
+# 这是 PM 的「本地直连」通道，和 IM 桥（feishu-bridge）是【同一个 PM 角色】——都从持久层
+# (GitHub Issue/Projects + 知识库 + runs.jsonl) 水合，看到同一个世界；不同的只是触发方式。
 # 注：故意【不挂 army-guard】——PAUSE 是给自动任务的；你本人随时可找 PM 聊，
 #     甚至正是用这个会话来决定要不要 resume 军团。
 cd ~/army || exit 1

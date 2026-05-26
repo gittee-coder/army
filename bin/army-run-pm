@@ -19,6 +19,7 @@ print(os.path.expanduser(p["path"]), p.get("repo") or "")
 PY
 )
 [[ -n "${repo:-}" ]] || { echo "项目 $proj 无 repo（research 画像走别的路）"; exit 1; }
+# gh 用其自身 auth；org 仓如需 org-scoped token，运行本脚本前 export GH_TOKEN。
 gh label create army/triaged --repo "$repo" --color fbca04 --description "PM 已分诊" 2>/dev/null || true
 
 prompt="你是 PM，处理 $repo 的 Issue #$issue（项目 $proj）。
@@ -28,7 +29,7 @@ prompt="你是 PM，处理 $repo 的 Issue #$issue（项目 $proj）。
    \`~/army/bin/army-run-worker $proj $issue $wmodel\`（建 worktree + 起 worker + 开 PR；琐碎活可把 model 换 sonnet）。
 4) 报告 worker 开的 PR 号 + 一句结论；记 ledger：
    \`~/army/bin/army-ledger --role pm --issue $issue --result ok --task \"triage+dispatch $repo#$issue\"\`。
-铁律：不亲自改代码、不合并 PR（合并是 pyf 审批）。Auditor 由 dispatcher 另行触发，你不用管。"
+铁律：不亲自改代码、不合并 PR（合并是人审批）。Auditor 由 dispatcher 另行触发，你不用管。"
 
 start=$(date +%s); cd ~/army
 set +e

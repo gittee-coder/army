@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# 每日把作战看板刷新并推到站点仓。挂在 army-dispatch 末尾常驻调用，
+# 自身按【日历天】节流：每天只真推一次，其余 15min 轮询调用直接 no-op 返回。
+# 幂等：无数据变化 → 不提交；push 失败（如 rebase 冲突）→ 不打戳，下轮重试。
+#
+# 全部站点参数走 env（不硬编码任何私有仓/路径/URL）：
+#   ARMY_SITE_DIR   本地站点仓工作目录（必填，如 ~/site）
+#   ARMY_SITE_REMOTE  推送 remote（git URL；默认用站点仓自带 origin）
+#   ARMY_SITE_PAGE  看板在站点仓内的相对路径（默认 showcases/army-ops/index.html）
+#   ARMY_OUT        army-dashboard 输出 HTML 的绝对路径（应等于 $ARMY_SITE_DIR/$ARMY_SITE_PAGE）
+# org 仓如需 org-scoped token：运行前 export GH_TOKEN，本脚本会拼进 x-access-token remote。
+set -euo pipefail
+~/army/bin/army-guard || exit 0   # PAUSE 时不动
+
+site_dir="${ARMY_SITE_DIR:-}"
+[[ -n "$site_dir" && -d "$site_dir" ]] || { echo "[dashboard-sync] 未配 ARMY_SITE_DIR，跳过"; exit 0; }
+page="${ARMY_SITE_PAGE:-showcases/army-ops/index.html}"
+
+stamp="$HOME/army/log/.dashboard-sync-date"
+today="$(date +%F)"
+[[ "$(cat "$stamp" 2>/dev/null || true)" == "$today" ]] && exit 0   # 今天已同步
+
+# 生成 HTML（ARMY_OUT 默认指到站点仓内的 page）
+export ARMY_OUT="${ARMY_OUT:-$site_dir/$page}"
+python3 ~/army/bin/army-dashboard >/dev/null
+
+cd "$site_dir"
+# remote：优先 ARMY_SITE_REMOTE；否则用仓库自带 origin。若设了 GH_TOKEN，拼成 x-access-token 形式。
+remote="${ARMY_SITE_REMOTE:-origin}"
+if [[ -n "${GH_TOKEN:-}" && "$remote" == https://github.com/* ]]; then
+  remote="https://x-access-token:${GH_TOKEN}@${remote#https://}"
+fi
+
+if ! git diff --quiet -- "$page"; then
+  git add "$page"
+  git commit -q -m "showcase: army-ops 看板每日同步 ($today)" \
+    -m "Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+fi
+
+git fetch -q "$remote" main
+git rebase -q FETCH_HEAD || { git rebase --abort 2>/dev/null || true; echo "[dashboard-sync] rebase 冲突，本轮跳过"; exit 1; }
+git push -q "$remote" HEAD:main
+echo "$today" > "$stamp"
+echo "[dashboard-sync] 已同步 $today"

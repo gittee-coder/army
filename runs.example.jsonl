@@ -1,3 +1,12 @@
-{"ts": "2026-05-23T00:48:30.477948+00:00", "role": "worker", "task": "fix your-org/cue#1 (cue)", "issue": 1, "duration_s": 125.0, "result": "ok"}
+{"ts": "2026-05-23T00:48:17.617675+00:00", "role": "worker", "task": "fix your-org/cue#1 (cue)", "issue": 1, "duration_s": 125.0, "files_touched": ["src/pages/Home.tsx"], "result": "ok"}
 {"ts": "2026-05-23T00:56:27.466030+00:00", "role": "auditor", "task": "review your-org/cue PR#2 (cue)", "issue": 1, "duration_s": 90.0, "result": "ok"}
 {"ts": "2026-05-23T12:10:24.551876+00:00", "role": "pm", "task": "triage your-org/cue#1: already resolved — PR#2 merged, issue CLOSED/COMPLETED; no re-dispatch (would duplicate)", "issue": 1, "result": "ok"}
+{"ts": "2026-05-26T02:40:35.403540+00:00", "role": "redline", "task": "RED ['git push 到 main/master'] (Bash): git push origin main", "result": "warn"}
+{"ts": "2026-05-26T04:09:49.026254+00:00", "role": "redline", "task": "RED ['git force-push（必审批）'] (Bash): git push --force origin army/issue-1", "result": "deny"}
+{"ts": "2026-05-26T04:09:49.131399+00:00", "role": "redline", "task": "RED ['改 .env / 密钥凭据文件'] (Write): config/secrets.json", "result": "deny"}
+{"ts": "2026-05-26T04:09:49.285888+00:00", "role": "redline", "task": "RED ['删 prod 资源（rm -rf 危险路径）'] (Bash): rm -rf /var/www/prod", "result": "deny"}
+{"ts": "2026-05-26T04:30:22.139980+00:00", "role": "worker", "task": "fix your-org/cue#3 (cue)", "issue": 3, "duration_s": 289.0, "files_touched": ["src/lib/synth.ts", "src/data/emotions.ts"], "result": "ok"}
+{"ts": "2026-05-26T04:30:40.934304+00:00", "role": "pm", "task": "triage+dispatch your-org/cue#3", "issue": 3, "result": "ok"}
+{"ts": "2026-05-26T04:32:52.455631+00:00", "role": "auditor", "task": "review your-org/cue PR#4 (cue)", "issue": 3, "duration_s": 121.0, "result": "ok"}
+{"ts": "2026-05-26T04:34:14.336048+00:00", "role": "pm", "task": "im 审批合并 your-org/cue#4", "result": "ok"}
+{"ts": "2026-05-26T04:50:30.404384+00:00", "role": "pm", "task": "im @PM: 说一下你的职责边界与红线", "result": "ok"}

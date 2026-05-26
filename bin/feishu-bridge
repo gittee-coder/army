@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""army feishu-bridge —— IM 自建应用 WebSocket 长连接（编排循环 §4.1，这里用飞书）。
+
+收 Army 群事件 → 路由到 army：
+  ① 群里 @机器人 文本 → 唤起 headless PM（窗口内同群 follow-up 走 --resume），流式回结果到群。
+  ② 互动卡片按钮回调 → 审批合并 / 看 diff / 拒绝（action.value 约定 {action,repo,pr,issue}）。
+
+常驻进程（systemd user service）。总开关 `~/.army-state`=PAUSE 时只回执、不动作。
+凭据走 env 文件 `~/.army/im.env`（FEISHU_APP_ID/SECRET/CHAT_ID；不入 git）。
+PM 调用挂 ~/.claude 全局 auth，边际成本≈0。
+gh 用其自身 auth；org 仓如需 org-scoped token，启动本服务前 export GH_TOKEN。
+"""
+import os, sys, re, json, time, uuid, subprocess, threading, datetime, pathlib
+import lark_oapi as lark
+from lark_oapi.api.im.v1 import (P2ImMessageReceiveV1, CreateMessageRequest, CreateMessageRequestBody)
+from lark_oapi.api.cardkit.v1 import (CreateCardRequest, CreateCardRequestBody,
+    ContentCardElementRequest, ContentCardElementRequestBody)
+
+ARMY = pathlib.Path(os.path.expanduser("~/army"))
+ENV = pathlib.Path(os.path.expanduser(os.environ.get("ARMY_IM_ENV", "~/.army/im.env")))
+PM_ROLE = ARMY / "roles" / "pm.md"
+LOG = ARMY / "log" / "feishu-bridge.log"
+SEND = str(ARMY / "bin" / "feishu-send")
+LEDGER = str(ARMY / "bin" / "army-ledger")
+GH = os.environ.get("GH_BIN", "gh")
+
+
+def load_env():
+    cfg = {}
+    if ENV.exists():
+        for line in ENV.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    for k in ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_CHAT_ID"):
+        if os.environ.get(k):
+            cfg[k] = os.environ[k]
+    return cfg
+
+
+CFG = load_env()
+APP_ID = CFG.get("FEISHU_APP_ID")
+APP_SECRET = CFG.get("FEISHU_APP_SECRET")
+CHAT_ID = CFG.get("FEISHU_CHAT_ID")
+
+# REST 客户端（建/发/刷流式卡片用；WS 长连接是另一个 lark.ws.Client）
+API = (lark.Client.builder().app_id(APP_ID or "x").app_secret(APP_SECRET or "y").build())
+PM_ELEM = "pm_body"      # 流式卡片里 markdown 正文元素 id
+CARD_MIN_INTERVAL = 0.35  # 卡片刷新最小间隔（s），<10/s 上限且避开静默丢弃
+
+_seen = set()                      # message_id 去重（IM 会重投）
+_session = {"id": None, "ts": 0.0}  # 单群 chat→session 映射；窗口内 follow-up resume 同一 session
+RESUME_TTL = 3600                  # = 提示词 cache TTL(1h 扩展缓存)。窗口内同群追问复用 session 吃缓存，别用 5min/10min 白丢缓存
+
+
+def log(m):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{datetime.datetime.now().isoformat(timespec='seconds')} {m}"
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+    print(line, flush=True)
+
+
+def paused():
+    st = pathlib.Path(os.path.expanduser(os.environ.get("ARMY_STATE", "~/.army-state")))
+    try:
+        return st.read_text().strip() == "PAUSE"
+    except FileNotFoundError:
+        return False
+
+
+def send(text, chat=None, md=False):
+    try:
+        cmd = [SEND, "--chat", chat or CHAT_ID]
+        if md:
+            cmd += ["--md", text]   # markdown → 互动卡片（加粗/列表/表格渲染）
+        else:
+            cmd.append(text)
+        subprocess.run(cmd, capture_output=True, timeout=25)
+    except Exception as e:
+        log(f"send error: {e}")
+
+
+def card_create_and_send(summary, chat=None):
+    """建一张流式卡片（streaming_mode）+ 发到群。成功返回 card_id，失败返回 None（调用方回退纯文本）。"""
+    card = {"schema": "2.0",
+            "config": {"streaming_mode": True,
+                       "summary": {"content": summary}},
+            "header": {"title": {"tag": "plain_text", "content": "PM · 处理中…"},
+                       "template": "blue"},
+            "body": {"elements": [{"tag": "markdown", "content": "", "element_id": PM_ELEM}]}}
+    try:
+        r = API.cardkit.v1.card.create(CreateCardRequest.builder().request_body(
+            CreateCardRequestBody.builder().type("card_json")
+            .data(json.dumps(card, ensure_ascii=False)).build()).build())
+        if not r.success():
+            log(f"card create fail: {r.code} {r.msg}")
+            return None
+        cid = r.data.card_id
+        content = json.dumps({"type": "card", "data": {"card_id": cid}})
+        m = API.im.v1.message.create(CreateMessageRequest.builder().receive_id_type("chat_id")
+            .request_body(CreateMessageRequestBody.builder().receive_id(chat or CHAT_ID)
+                          .msg_type("interactive").content(content).build()).build())
+        if not m.success():
+            log(f"card send fail: {m.code} {m.msg}")
+            return None
+        return cid
+    except Exception as e:
+        log(f"card_create_and_send error: {e}")
+        return None
+
+
+def card_update(cid, text, seq):
+    """流式刷新卡片正文（全量 set，sequence 必须严格递增）。返回 ok。"""
+    try:
+        r = API.cardkit.v1.card_element.content(ContentCardElementRequest.builder()
+            .card_id(cid).element_id(PM_ELEM).request_body(
+                ContentCardElementRequestBody.builder().content(text or " ")
+                .sequence(seq).uuid(str(uuid.uuid4())).build()).build())
+        if not r.success():
+            log(f"card update seq={seq} fail: {r.code} {r.msg}")
+        return r.success()
+    except Exception as e:
+        log(f"card_update error: {e}")
+        return False
+
+
+def ledger(task, result="ok"):
+    try:
+        subprocess.run([LEDGER, "--role", "pm", "--task", task, "--result", result],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def gh_env(repo):
+    # gh 用自身 auth；org 仓如需 org-scoped token，启动服务前 export GH_TOKEN。
+    return dict(os.environ)
+
+
+def _human(n):
+    """token 数 → 紧凑显示：36964→37.0k，1832→1.83k，183→183。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "0"
+    if n >= 10000:
+        return f"{n / 1000:.1f}k"
+    if n >= 1000:
+        return f"{n / 1000:.2f}k"
+    return str(n)
+
+
+def _model_short(j):
+    """从 modelUsage key 提取 opus/sonnet/haiku；取不到回退 opus（wake_pm 固定 opus）。"""
+    for k in (j.get("modelUsage") or {}):
+        m = re.search(r"opus|sonnet|haiku", k)
+        if m:
+            return m.group(0)
+    return "opus"
+
+
+def _context(j):
+    """当前 context 占用 / 窗口：取最后一轮 iteration 的输入侧 token 总和
+    （input + cache_read + cache_creation = 真正喂进模型的上下文），窗口取 modelUsage.contextWindow。"""
+    u = j.get("usage") or {}
+    iters = u.get("iterations") or []
+    src = iters[-1] if iters else u
+    used = ((src.get("input_tokens") or 0) + (src.get("cache_read_input_tokens") or 0)
+            + (src.get("cache_creation_input_tokens") or 0))
+    win = 0
+    for v in (j.get("modelUsage") or {}).values():
+        win = v.get("contextWindow") or 0
+        break
+    if not win:
+        return None
+    return f"{used / win * 100:.0f}% ctx ({_human(used)}/{win // 1000}k)"
+
+
+def _statusline(j, used_resume, rc, cache_expire):
+    """仿本地 status line：模型·resume·耗时·轮数·context·cache过期时刻·成本·session。
+    cache_expire = 本 session prompt cache 失效的 epoch 时刻（对齐 RESUME_TTL；之前追问 resume 命中缓存）。
+    j 为空（无 json，如崩溃）时给简版。"""
+    if not j:
+        return f"rc={rc} · 无 metrics"
+    parts = [
+        f"`{_model_short(j)}`" + ("·resume" if used_resume else "·new"),
+        f"{(j.get('duration_ms') or 0) / 1000:.0f}s",
+        f"{j.get('num_turns', '?')}轮",
+    ]
+    ctx = _context(j)
+    if ctx:
+        parts.append(ctx)
+    parts.append(f"cache->{datetime.datetime.fromtimestamp(cache_expire).strftime('%H:%M')}"
+                 if cache_expire else "cache —")
+    parts += [
+        f"${j.get('total_cost_usd', 0):.3f}",
+        f"`{(j.get('session_id') or '')[:8]}`",
+    ]
+    if j.get("is_error"):
+        parts.insert(0, "[err]")
+    if j.get("permission_denials"):
+        parts.append(f"deny{len(j['permission_denials'])}")
+    return " · ".join(parts)
+
+
+def wake_pm(text):
+    """headless PM，**流式回群**：建一张 streaming 卡片，边解析 claude stream-json 边刷卡片
+    （token 级 text_delta + 工具调用标记），跑完落定全文 + status line。
+    RESUME_TTL(1h，对齐 cache TTL) 内同群 follow-up 走 --resume 吃缓存。
+    任何流式/卡片失败都回退到旧的纯文本 send，绝不丢回复。"""
+    now = time.time()
+    used_resume = bool(_session["id"] and now - _session["ts"] < RESUME_TTL)
+    cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
+           "--include-partial-messages",
+           "--append-system-prompt", PM_ROLE.read_text(), "--model", "opus"]
+    if used_resume:
+        cmd += ["--resume", _session["id"]]
+    cmd.append(text)
+
+    cid = card_create_and_send(f"PM 处理中：{text[:40]}")
+    j, sid = None, None
+    seen_tools = set()
+    # 读 stdout 的主循环只往 st["body"] 追加（永不阻塞于网络）；独立 pusher 线程按
+    # CARD_MIN_INTERVAL 把最新全文推 IM。二者解耦，吐字不再被同步刷卡的 HTTP 往返卡住。
+    st = {"body": "", "seq": 1, "pushed_len": -1}
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def pusher():
+        while not stop.wait(CARD_MIN_INTERVAL):
+            with lock:
+                b = st["body"]
+                if len(b) == st["pushed_len"]:
+                    continue
+                s = st["seq"]; st["seq"] += 1; st["pushed_len"] = len(b)
+            card_update(cid, b[:9000], s)           # 网络调用在锁外，不挡读循环
+
+    pt = None
+    if cid:
+        pt = threading.Thread(target=pusher, daemon=True); pt.start()
+
+    try:
+        p = subprocess.Popen(cmd, cwd=str(ARMY), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        start = time.time()
+        for line in p.stdout:
+            if time.time() - start > 900:           # 15min 硬上限
+                p.kill(); break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            et = ev.get("type")
+            if et == "stream_event":                # token 级增量
+                e = ev.get("event", {})
+                if e.get("type") == "content_block_delta":
+                    d = e.get("delta", {})
+                    if d.get("type") == "text_delta":
+                        with lock:
+                            st["body"] += d.get("text", "")
+            elif et == "assistant":                 # 整块（含 tool_use 标记）
+                for b in ev.get("message", {}).get("content", []):
+                    if b.get("type") == "tool_use" and b.get("id") not in seen_tools:
+                        seen_tools.add(b.get("id"))
+                        with lock:
+                            st["body"] += f"\n\n› 调用 `{b.get('name','tool')}`…\n"
+            elif et == "result":                    # 收尾：全文 + metrics
+                j = ev
+                sid = ev.get("session_id")
+                if ev.get("result"):
+                    with lock:
+                        st["body"] = ev["result"]
+        p.wait(timeout=10)
+        rc = p.returncode or 0
+    except Exception as e:
+        log(f"wake_pm stream error: {e}")
+        rc = 1
+
+    stop.set()
+    if pt:
+        pt.join(timeout=2)                          # 等 pusher 收手，收尾 seq 不与其撞序
+
+    if sid:
+        _session["id"], _session["ts"] = sid, now
+    body = st["body"]
+    if not body:
+        body = f"PM 进程异常 rc={rc}" + (("：" + (j.get("result") or "")) if j else "")
+    cache_expire = (_session["ts"] + RESUME_TTL) if _session["id"] else 0
+    status = _statusline(j, used_resume, rc, cache_expire)
+    final_md = f"**【PM】**\n{body[:3500]}\n\n---\n{status}"
+    if cid:
+        with lock:
+            s = st["seq"]; st["seq"] += 1
+        card_update(cid, final_md, s)               # 落定全文 + status line
+    else:
+        send(final_md, md=True)                     # 卡片没建起来 → 回退纯文本
+    ledger(f"im @PM: {text[:80]}", "ok" if rc == 0 else "fail")
+
+
+def extract_text(msg):
+    try:
+        c = json.loads(msg.content)
+    except Exception:
+        return ""
+    return re.sub(r"@_user_\d+", "", c.get("text", "")).strip()
+
+
+def on_message(data: P2ImMessageReceiveV1):
+    try:
+        ev = data.event
+        msg = ev.message
+        mid = msg.message_id
+        if mid in _seen:
+            return
+        _seen.add(mid)
+        if len(_seen) > 2000:
+            _seen.clear()
+        # 只认配置的群 + 只认人发的（滤掉 bot 自己的消息防回环）
+        if CHAT_ID and msg.chat_id != CHAT_ID:
+            return
+        if getattr(ev.sender, "sender_type", "user") != "user":
+            return
+        if msg.message_type != "text":
+            return
+        text = extract_text(msg)
+        if not text:
+            return
+        log(f"recv @PM: {text[:120]}")
+        if paused():
+            send("军团已 PAUSE（~/.army-state），@PM 不动作。`echo RUN > ~/.army-state` 恢复。")
+            return
+        # 不再发文本 ack：wake_pm 会立刻建一张流式卡片当实时回执 + 边跑边刷
+        threading.Thread(target=wake_pm, args=(text,), daemon=True).start()
+    except Exception as e:
+        log(f"on_message error: {e}")
+
+
+def on_card(data):
+    """互动卡片按钮回调。action.value 约定 {action: merge|diff|reject, repo, pr, issue}。"""
+    try:
+        val = getattr(data.event.action, "value", None) or {}
+        if isinstance(val, str):
+            val = json.loads(val)
+        act, repo, pr = val.get("action"), val.get("repo"), val.get("pr")
+        log(f"card action: {act} {repo}#{pr}")
+        if paused():
+            send("已 PAUSE，卡片动作忽略。")
+            return None
+        if act == "merge" and repo and pr:
+            r = subprocess.run([GH, "pr", "merge", str(pr), "--repo", repo, "--squash", "--delete-branch"],
+                               capture_output=True, text=True, env=gh_env(repo), timeout=90)
+            ok = r.returncode == 0
+            send(f"{'已合并' if ok else '合并失败'} {repo} PR#{pr}\n{(r.stderr or r.stdout).strip()[:300]}")
+            ledger(f"im 审批合并 {repo}#{pr}", "ok" if ok else "fail")
+        elif act == "diff" and repo and pr:
+            r = subprocess.run([GH, "pr", "diff", str(pr), "--repo", repo],
+                               capture_output=True, text=True, env=gh_env(repo), timeout=60)
+            send(f"{repo} PR#{pr} diff（截断）:\n{r.stdout[:3000]}")
+        elif act == "reject" and repo and pr:
+            subprocess.run([GH, "pr", "comment", str(pr), "--repo", repo,
+                            "--body", "IM 审批：拒绝，打回 worker 重做。"],
+                           capture_output=True, env=gh_env(repo), timeout=60)
+            send(f"已拒绝 {repo} PR#{pr}，打回 worker。")
+            ledger(f"im 拒绝 {repo}#{pr}", "ok")
+    except Exception as e:
+        log(f"on_card error: {e}")
+    return None
+
+
+def main():
+    if not (APP_ID and APP_SECRET):
+        log("缺 FEISHU_APP_ID/SECRET，退出")
+        sys.exit(2)
+    handler = (lark.EventDispatcherHandler.builder("", "")
+               .register_p2_im_message_receive_v1(on_message)
+               .register_p2_card_action_trigger(on_card)
+               .build())
+    log(f"feishu-bridge 启动，chat={CHAT_ID}")
+    cli = lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.INFO)
+    cli.start()  # 阻塞，自动重连
+
+
+if __name__ == "__main__":
+    main()

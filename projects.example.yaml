@@ -4,7 +4,7 @@
 #
 # worker_type:
 #   code     —— PR-to-merge：开分支 → 改 → 测 → 开 PR → Auditor review → 审批合并
-#   media    —— 产物落盘 + 关键节点审批（非 PR 模型）
+#   media    —— 产物落盘 + 关键节点审批（非 PR 模型；包装层待建，worker 自记 ledger）
 #   research —— 文件级改 + 报告/ledger（无 git repo 时无 PR 流）
 
 projects:
@@ -26,10 +26,18 @@ projects:
     test: "make test"
     worktree_base: ~/army/worktrees/example-app
 
+  # —— 模板：media 画像（产物落盘 + 关键节点审批，非 PR 流）——
+  example-media:
+    department: media
+    worker_type: media
+    path: ~/work/example-media
+    repo: null                    # 本地有 git repo 但无 GitHub remote → dispatch 不自动接（无 auto-eligible Issue 流）
+    notes: media worker 产物落盘到项目约定目录、关键节点等人审批；army 侧 media 包装层待建，当前 worker 自记 ledger。
+
   # —— 模板：research 画像（无 git repo → 走文件级改 + ledger，无 PR 流）——
   example-research:
     department: research
     worker_type: research
     path: ~/work/example-research
     repo: null
-    notes: 未 git init → 无 PR 流；想要 PR 流先 init + 建 repo，再改 worker_type=code
+    notes: 未 git init → 无 PR 流；想要 PR 流先 init + 建 repo，再改 worker_type=code。

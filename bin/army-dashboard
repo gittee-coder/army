@@ -1,0 +1,922 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+army-dashboard — 把运行账本 runs.jsonl 渲染成一个对外公开、自包含的
+「AI 军团作战日志看板」HTML，发布到你的站点。
+
+行为：
+  1. 读 ~/army/runs.jsonl（每行一个 JSON）
+  2. 脱敏：剔除绝对路径 / token / IP；task 中的绝对路径替换为 basename
+  3. 聚合统计（总数 / 角色分布 / 成功率 / worker 总耗时 / 红线拦截 / 活跃天数 / 时间线）
+  4. 生成完全自包含单文件 HTML（内联 CSS+JS，无外部依赖，无 emoji），数据内联
+  5. print 文件路径 + 统计摘要
+
+用法：python3 ~/army/bin/army-dashboard
+环境变量：
+  ARMY_LEDGER   账本路径（默认 ~/army/runs.jsonl）
+  ARMY_OUT      输出 HTML 路径（默认 ~/army/dashboard/index.html；通常 export 指到你的站点仓内，
+                由 army-dashboard-sync 推送）
+"""
+from __future__ import annotations
+
+import html
+import json
+import os
+import re
+import sys
+from collections import Counter, OrderedDict, defaultdict
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+HOME = Path.home()
+LEDGER = Path(os.environ.get("ARMY_LEDGER", HOME / "army" / "runs.jsonl"))
+OUT = Path(os.environ.get("ARMY_OUT", HOME / "army" / "dashboard" / "index.html"))
+
+# 北京时间（CST, UTC+8）展示
+CST = timezone(timedelta(hours=8))
+
+ROLES = ("pm", "worker", "auditor", "redline")
+ROLE_LABEL = {"pm": "PM", "worker": "Worker", "auditor": "Auditor", "redline": "Redline"}
+RESULTS = ("ok", "warn", "deny", "fail")
+
+# ---------------------------------------------------------------------------
+# 脱敏
+# ---------------------------------------------------------------------------
+
+# 绝对/家目录路径片段（含可选 schema 前缀的不动，纯文件系统路径才打）
+_ABS_PATH = re.compile(r"(?<![\w/])(?:/[\w.\-]+){2,}/?|~(?:/[\w.\-]+)+/?")
+_IP = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b")
+# 常见 token 形态：长 base64ish / hex / sk- / ghp_ / IM app token 等
+_TOKEN = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_\-]{12,}|ghp_[A-Za-z0-9]{20,}|gh[posu]_[A-Za-z0-9]{20,}"
+    r"|cli_[A-Za-z0-9]{12,}|xoxb-[A-Za-z0-9\-]{12,}|AKIA[A-Z0-9]{12,}"
+    r"|[A-Fa-f0-9]{32,}|[A-Za-z0-9_\-]{40,})\b"
+)
+
+
+def _basename_path(m: re.Match) -> str:
+    """把命中的绝对路径替换为 basename（保留尾部斜杠语义为目录名）。"""
+    p = m.group(0)
+    trailing = p.endswith("/")
+    base = os.path.basename(p.rstrip("/"))
+    if not base:
+        return ""
+    return base + ("/" if trailing else "")
+
+
+def sanitize_text(s: str) -> str:
+    """对自由文本做脱敏：token → [redacted]，IP → [ip]，绝对路径 → basename。"""
+    if not s:
+        return s
+    s = _TOKEN.sub("[redacted]", s)
+    s = _IP.sub("[ip]", s)
+    s = _ABS_PATH.sub(_basename_path, s)
+    return s
+
+
+def sanitize_files(files) -> list[str]:
+    """files_touched 已是相对路径，但仍剔除任何意外的绝对路径/敏感串。"""
+    out = []
+    for f in files or []:
+        if not isinstance(f, str):
+            continue
+        f = sanitize_text(f).strip()
+        if f:
+            out.append(f)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 读账本
+# ---------------------------------------------------------------------------
+
+def load_runs(path: Path) -> list[dict]:
+    if not path.exists():
+        print(f"!! 账本不存在：{path}", file=sys.stderr)
+        return []
+    runs = []
+    for ln, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"!! 第 {ln} 行解析失败，跳过：{e}", file=sys.stderr)
+            continue
+        if not isinstance(rec, dict):
+            continue
+        runs.append(rec)
+    return runs
+
+
+def clean_record(rec: dict) -> dict | None:
+    """只输出白名单字段并脱敏。"""
+    role = rec.get("role")
+    if role not in ROLES:
+        # 未知角色也保留，但归一化
+        role = str(role or "?").lower()
+    ts = rec.get("ts")
+    out = {
+        "ts": ts if isinstance(ts, str) else None,
+        "role": role,
+        "task": sanitize_text(str(rec.get("task", ""))),
+    }
+    if "issue" in rec and isinstance(rec["issue"], int):
+        out["issue"] = rec["issue"]
+    if "duration_s" in rec:
+        try:
+            out["duration_s"] = round(float(rec["duration_s"]), 1)
+        except (TypeError, ValueError):
+            pass
+    res = rec.get("result")
+    if res in RESULTS:
+        out["result"] = res
+    elif res:
+        out["result"] = "ok"  # 归一化未知 result
+    files = sanitize_files(rec.get("files_touched"))
+    if files:
+        out["files_touched"] = files
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 聚合统计
+# ---------------------------------------------------------------------------
+
+def parse_ts(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def aggregate(records: list[dict]) -> dict:
+    total = len(records)
+    role_counts = Counter(r["role"] for r in records)
+
+    # 成功率：只看「作战行」（pm/worker/auditor），ok 占比。
+    # redline 行不计入——对守卫而言 deny 是成功的拦截而非失败，混进来会反向拉低分母。
+    op_records = [r for r in records if r["role"] != "redline" and "result" in r]
+    ok_n = sum(1 for r in op_records if r["result"] == "ok")
+    success_rate = (ok_n / len(op_records) * 100) if op_records else 0.0
+    with_result = op_records
+
+    # worker 总耗时
+    worker_secs = sum(r.get("duration_s", 0) for r in records if r["role"] == "worker")
+    worker_runs = [r for r in records if r["role"] == "worker"]
+
+    # 红线：deny 才算"真正拦截"；warn 是演练/告警
+    redline = [r for r in records if r["role"] == "redline"]
+    redline_deny = sum(1 for r in redline if r.get("result") == "deny")
+    redline_warn = sum(1 for r in redline if r.get("result") == "warn")
+
+    # 红线分类：从 task 里抽 RED [...] 标签
+    red_cats = Counter()
+    for r in redline:
+        m = re.search(r"RED\s*\[\s*'([^']+)'\s*\]", r["task"])
+        if m:
+            red_cats[m.group(1)] += 1
+
+    # 活跃天数（按 CST 日期）
+    days = set()
+    dts = []
+    for r in records:
+        dt = parse_ts(r["ts"])
+        if dt:
+            dts.append(dt)
+            days.add(dt.astimezone(CST).date())
+    active_days = len(days)
+    last_dt = max(dts) if dts else None
+    first_dt = min(dts) if dts else None
+
+    # 闭环数：以 issue 维度统计「triage/dispatch + worker PR + auditor review + 审批合并」齐全的 issue
+    # 简化口径：被 worker 实跑且 result=ok 的不同 issue 数（已端到端修复并合并）
+    closed_issues = sorted({
+        r["issue"] for r in records
+        if r["role"] == "worker" and r.get("result") == "ok" and isinstance(r.get("issue"), int)
+    })
+
+    # issue 维度的完整闭环编排（用于 pipeline 叙事 / 时间线分组）
+    issue_track = defaultdict(lambda: defaultdict(int))
+    for r in records:
+        iss = r.get("issue")
+        if isinstance(iss, int):
+            issue_track[iss][r["role"]] += 1
+
+    # PR 提及数（worker 行里出现 PR / files_touched）
+    pr_runs = [r for r in worker_runs if "files_touched" in r]
+
+    return {
+        "total": total,
+        "role_counts": dict(role_counts),
+        "success_rate": success_rate,
+        "ok_n": ok_n,
+        "with_result_n": len(with_result),
+        "worker_secs": worker_secs,
+        "worker_runs": len(worker_runs),
+        "pr_runs": len(pr_runs),
+        "redline_total": len(redline),
+        "redline_deny": redline_deny,
+        "redline_warn": redline_warn,
+        "red_cats": dict(red_cats.most_common()),
+        "active_days": active_days,
+        "last_dt": last_dt,
+        "first_dt": first_dt,
+        "closed_issues": closed_issues,
+        "closed_n": len(closed_issues),
+        "issue_track": {k: dict(v) for k, v in issue_track.items()},
+    }
+
+
+# ---------------------------------------------------------------------------
+# HTML 渲染
+# ---------------------------------------------------------------------------
+
+def fmt_dt_cst(dt: datetime | None, with_time=True) -> str:
+    if not dt:
+        return "—"
+    local = dt.astimezone(CST)
+    if with_time:
+        return local.strftime("%Y-%m-%d %H:%M")
+    return local.strftime("%Y-%m-%d")
+
+
+def fmt_dur(secs: float) -> str:
+    if secs <= 0:
+        return ""
+    if secs < 60:
+        return f"{secs:.0f}s"
+    m, s = divmod(int(round(secs)), 60)
+    return f"{m}m{s:02d}s"
+
+
+def rel_day_label(dt: datetime, now: datetime) -> str:
+    """CST 日期分组标签。"""
+    d = dt.astimezone(CST).date()
+    today = now.astimezone(CST).date()
+    delta = (today - d).days
+    wk = "一二三四五六日"[d.weekday()]
+    if delta == 0:
+        return f"今天 · {d.strftime('%m-%d')} 周{wk}"
+    if delta == 1:
+        return f"昨天 · {d.strftime('%m-%d')} 周{wk}"
+    return f"{d.strftime('%Y-%m-%d')} 周{wk}"
+
+
+def esc(s) -> str:
+    return html.escape(str(s), quote=True)
+
+
+def build_html(records: list[dict], stats: dict) -> str:
+    now = datetime.now(timezone.utc)
+    gen_at = fmt_dt_cst(now)
+
+    rc = stats["role_counts"]
+
+    # ---- 时间线：倒序，按 CST 日期分组 ----
+    ts_records = [r for r in records if parse_ts(r["ts"])]
+    ts_records.sort(key=lambda r: parse_ts(r["ts"]), reverse=True)
+
+    timeline_html = []
+    cur_day = None
+    for r in ts_records:
+        dt = parse_ts(r["ts"])
+        day_lbl = rel_day_label(dt, now)
+        if day_lbl != cur_day:
+            cur_day = day_lbl
+            timeline_html.append(
+                f'<div class="day-sep"><span class="day-dot"></span>'
+                f'<span class="day-lbl">{esc(day_lbl)}</span></div>'
+            )
+        role = r["role"]
+        rlabel = ROLE_LABEL.get(role, role.upper())
+        time_s = dt.astimezone(CST).strftime("%H:%M:%S")
+        result = r.get("result", "")
+        issue = r.get("issue")
+        dur = fmt_dur(r.get("duration_s", 0))
+
+        meta_bits = []
+        if issue is not None:
+            meta_bits.append(f'<span class="chip chip-issue">#{esc(issue)}</span>')
+        if dur:
+            meta_bits.append(f'<span class="chip chip-dur">{esc(dur)}</span>')
+        if result:
+            meta_bits.append(f'<span class="chip chip-res chip-{esc(result)}">{esc(result.upper())}</span>')
+        meta = "".join(meta_bits)
+
+        files_html = ""
+        if r.get("files_touched"):
+            chips = "".join(
+                f'<code class="filechip">{esc(f)}</code>' for f in r["files_touched"]
+            )
+            files_html = f'<div class="files">{chips}</div>'
+
+        timeline_html.append(
+            f'<div class="log-row" data-role="{esc(role)}">'
+            f'<div class="log-rail"><span class="rail-dot rail-{esc(role)}"></span></div>'
+            f'<div class="log-body">'
+            f'<div class="log-head">'
+            f'<span class="role-tag role-{esc(role)}">{esc(rlabel)}</span>'
+            f'<time class="log-time">{esc(time_s)}</time>'
+            f'<span class="log-meta">{meta}</span>'
+            f'</div>'
+            f'<div class="log-task">{esc(r["task"])}</div>'
+            f'{files_html}'
+            f'</div>'
+            f'</div>'
+        )
+    timeline_html = "\n".join(timeline_html)
+
+    # ---- 红线分类 ----
+    red_cat_rows = []
+    # 友好归并：把"必审批"等后缀差异合并
+    norm_map = {}
+    for cat, n in stats["red_cats"].items():
+        key = re.sub(r"（.*?）", "", cat).strip()
+        norm_map[key] = norm_map.get(key, 0) + n
+    # 保证四类核心都出现，即便计数为 0
+    core = OrderedDict([
+        ("git push 到 main/master", "拦截直推主干"),
+        ("git force-push", "拦截强制推送"),
+        ("改 .env / 密钥凭据文件", "保护密钥凭据"),
+        ("删 prod 资源", "阻断生产删除"),
+    ])
+    matched = set()
+    for key, desc in core.items():
+        cnt = 0
+        for k, n in norm_map.items():
+            if key.split(" ")[0] in k or k.startswith(key.split("（")[0][:6]):
+                if key == "git push 到 main/master" and "force" in k:
+                    continue
+                cnt += n
+                matched.add(k)
+        red_cat_rows.append((key, desc, cnt))
+
+    red_cards = "".join(
+        f'<div class="red-card">'
+        f'<div class="red-card-top"><span class="red-rule">{esc(key)}</span>'
+        f'<span class="red-cnt">{cnt}<small>次</small></span></div>'
+        f'<div class="red-desc">{esc(desc)}</div>'
+        f'</div>'
+        for key, desc, cnt in red_cat_rows
+    )
+
+    # ---- 角色卡数据 ----
+    role_meta = OrderedDict([
+        ("pm", ("PM", "项目经理", "分诊 GitHub Issue，判断是否已解决 / 重复，决定派工并下发任务给 Worker。也是 IM 对话的接待面。")),
+        ("worker", ("Worker", "执行者", "建独立 git worktree，改代码、跑测试、开 PR。绝不向 main 推送——交付物永远是一个待审的 PR。")),
+        ("auditor", ("Auditor", "审计员", "只读审查 PR diff，给出 VERDICT：LGTM 或 CHANGES。不写代码、不合并，是质量闸门。")),
+        ("redline", ("Redline", "红线守卫", "PreToolUse hook，对每次工具调用做确定性匹配。命中危险操作直接 deny——这是不依赖模型自觉的硬约束。")),
+    ])
+    role_cards = ""
+    for role, (name, sub, desc) in role_meta.items():
+        cnt = rc.get(role, 0)
+        extra = ""
+        if role == "redline":
+            extra = (f'<div class="role-stat"><b>{stats["redline_deny"]}</b> 次确定性拦截 '
+                     f'<span class="role-stat-sub">/ {stats["redline_warn"]} 次告警</span></div>')
+        elif role == "worker":
+            wsec = fmt_dur(stats["worker_secs"]) or "0s"
+            extra = f'<div class="role-stat"><b>{stats["pr_runs"]}</b> 个 PR · 累计 {esc(wsec)}</div>'
+        role_cards += (
+            f'<article class="role-card rc-{role}">'
+            f'<div class="rc-glyph rc-glyph-{role}" aria-hidden="true"></div>'
+            f'<div class="rc-head">'
+            f'<span class="rc-name">{esc(name)}</span>'
+            f'<span class="rc-sub">{esc(sub)}</span>'
+            f'</div>'
+            f'<p class="rc-desc">{esc(desc)}</p>'
+            f'<div class="rc-foot">'
+            f'<span class="rc-count">{cnt}</span><span class="rc-count-lbl">条作战记录</span>'
+            f'{extra}'
+            f'</div>'
+            f'</article>'
+        )
+
+    # ---- KPI ----
+    closed_n = stats["closed_n"]
+    closed_list = "、".join(f"cue#{i}" for i in stats["closed_issues"]) or "—"
+    sr = stats["success_rate"]
+    sr_disp = f"{sr:.0f}" if sr == int(sr) else f"{sr:.1f}"
+
+    # pipeline 阶段
+    pipeline_stages = [
+        ("Issue", "GitHub 报障", "io"),
+        ("PM", "分诊 / 派工", "pm"),
+        ("Worker", "worktree → 改码 → 测试 → PR", "worker"),
+        ("PR", "待审", "io"),
+        ("Auditor", "只读审查 → VERDICT", "auditor"),
+        ("审批", "IM 卡片 · 人点批准", "human"),
+        ("合并", "自动 merge", "io"),
+    ]
+    pipe_html = ""
+    for i, (label, sub, kind) in enumerate(pipeline_stages):
+        pipe_html += (
+            f'<div class="pipe-node pn-{kind}">'
+            f'<div class="pipe-chip">{esc(label)}</div>'
+            f'<div class="pipe-sub">{esc(sub)}</div>'
+            f'</div>'
+        )
+        if i < len(pipeline_stages) - 1:
+            pipe_html += '<div class="pipe-arrow" aria-hidden="true"><svg viewBox="0 0 28 12" width="28" height="12"><path d="M0 6 H22 M17 1 L23 6 L17 11" fill="none" stroke="currentColor" stroke-width="1.4"/></svg></div>'
+
+    # 时间跨度
+    span_txt = "—"
+    if stats["first_dt"] and stats["last_dt"]:
+        span_txt = f'{fmt_dt_cst(stats["first_dt"], with_time=False)} — {fmt_dt_cst(stats["last_dt"], with_time=False)}'
+
+    data_json = json.dumps(records, ensure_ascii=False)
+
+    # ============================ HTML ============================
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 军团 · 作战日志看板</title>
+<meta name="description" content="一个自治多 agent 软件组织的对外作战日志：PM 分诊、Worker 开 PR、Auditor 审查、Redline 红线守卫，端到端闭环已实跑。">
+<style>
+:root {{
+  --bg:        #0a0d11;
+  --bg-grid:   #0e1318;
+  --panel:     #11171e;
+  --panel-2:   #161d26;
+  --line:      #1f2832;
+  --line-soft: #18202a;
+  --ink:       #e7edf3;
+  --ink-2:     #9aa9b8;
+  --ink-3:     #5f6f7e;
+  --amber:     #f0b429;     /* 主信号：作战室琥珀 */
+  --amber-dim: #8a6a16;
+  --pm:        #38bdf8;     /* cyan */
+  --worker:    #34d399;     /* green */
+  --auditor:   #a78bfa;     /* violet */
+  --redline:   #f4584e;     /* red */
+  --human:     #f0b429;     /* amber */
+  --io:        #5f6f7e;     /* neutral */
+  --ok:        #34d399;
+  --warn:      #f0b429;
+  --deny:      #f4584e;
+  --fail:      #f4584e;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", "Menlo", "Consolas", "Noto Sans Mono CJK SC", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+}}
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+html {{ font-size:16px; -webkit-text-size-adjust:100%; }}
+body {{
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--ink);
+  line-height: 1.75;
+  letter-spacing: .01em;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+  background-image:
+    linear-gradient(var(--bg-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px);
+  background-size: 64px 64px;
+  background-position: center top;
+}}
+::selection {{ background: var(--amber); color:#0a0d11; }}
+::-webkit-scrollbar {{ width:10px; height:10px; }}
+::-webkit-scrollbar-track {{ background:var(--bg); }}
+::-webkit-scrollbar-thumb {{ background:var(--line); border-radius:0; border:2px solid var(--bg); }}
+::-webkit-scrollbar-thumb:hover {{ background:var(--amber-dim); }}
+
+.wrap {{ max-width:1100px; margin:0 auto; padding:0 24px; }}
+.mono {{ font-family:var(--mono); }}
+.tnum {{ font-variant-numeric: tabular-nums; font-feature-settings:"tnum"; }}
+
+/* ---------- top bar ---------- */
+.topbar {{
+  border-bottom:1px solid var(--line);
+  background: rgba(10,13,17,.82);
+  backdrop-filter: blur(8px);
+  position:sticky; top:0; z-index:50;
+}}
+.topbar .wrap {{ display:flex; align-items:center; gap:14px; height:54px; }}
+.brand {{ display:flex; align-items:center; gap:10px; font-family:var(--mono); font-weight:700; letter-spacing:.06em; font-size:.92rem; }}
+.brand .sig {{ width:10px; height:10px; background:var(--amber); box-shadow:0 0 12px var(--amber); animation:pulse 2.4s ease-in-out infinite; }}
+@keyframes pulse {{ 0%,100%{{opacity:1}} 50%{{opacity:.35}} }}
+.brand .live {{ font-size:.62rem; color:var(--amber); border:1px solid var(--amber-dim); padding:1px 6px; letter-spacing:.18em; }}
+.topbar .spacer {{ flex:1; }}
+.topbar .upd {{ font-family:var(--mono); font-size:.72rem; color:var(--ink-3); }}
+.topbar .upd b {{ color:var(--ink-2); font-weight:500; }}
+
+/* ---------- hero ---------- */
+.hero {{ padding:74px 0 44px; position:relative; }}
+.hero .eyebrow {{
+  font-family:var(--mono); font-size:.74rem; letter-spacing:.34em; text-transform:uppercase;
+  color:var(--amber); margin-bottom:22px;
+}}
+.hero h1 {{
+  font-size: clamp(2.3rem, 6vw, 4.15rem);
+  line-height:1.04; font-weight:800; letter-spacing:-0.01em;
+  max-width:16ch; text-wrap:balance;
+}}
+.hero h1 .em {{ color:var(--amber); }}
+.hero .lede {{
+  margin-top:24px; max-width:60ch; font-size:clamp(1rem,1.5vw,1.16rem);
+  color:var(--ink-2); line-height:1.85; text-wrap:pretty;
+}}
+.hero .lede b {{ color:var(--ink); font-weight:600; }}
+
+/* KPI */
+.kpis {{
+  margin-top:48px; display:grid; grid-template-columns:repeat(4,1fr);
+  border:1px solid var(--line); background:
+    linear-gradient(180deg, rgba(240,180,41,.03), transparent 40%), var(--panel);
+}}
+.kpi {{ padding:26px 24px; border-right:1px solid var(--line); position:relative; }}
+.kpi:last-child {{ border-right:0; }}
+.kpi .n {{
+  font-family:var(--mono); font-weight:700; font-size:clamp(2.4rem,5vw,3.4rem);
+  line-height:1; color:var(--ink); font-variant-numeric:tabular-nums;
+}}
+.kpi.accent .n {{ color:var(--amber); text-shadow:0 0 24px rgba(240,180,41,.28); }}
+.kpi .n small {{ font-size:.42em; color:var(--ink-3); font-weight:500; margin-left:3px; }}
+.kpi .lbl {{ margin-top:12px; font-size:.78rem; color:var(--ink-2); letter-spacing:.02em; }}
+.kpi .meta {{ margin-top:4px; font-family:var(--mono); font-size:.68rem; color:var(--ink-3); }}
+
+/* ---------- section frame ---------- */
+section.block {{ padding:54px 0; border-top:1px solid var(--line-soft); }}
+.sec-head {{ display:flex; align-items:baseline; gap:14px; margin-bottom:30px; flex-wrap:wrap; }}
+.sec-num {{ font-family:var(--mono); font-size:.78rem; color:var(--amber); letter-spacing:.1em; }}
+.sec-head h2 {{ font-size:clamp(1.35rem,2.6vw,1.85rem); font-weight:750; letter-spacing:-0.01em; }}
+.sec-head .sec-note {{ flex:1; min-width:200px; font-size:.85rem; color:var(--ink-3); text-align:right; align-self:center; }}
+
+/* ---------- role cards ---------- */
+.roles {{ display:grid; grid-template-columns:repeat(2,1fr); gap:1px; background:var(--line); border:1px solid var(--line); }}
+.role-card {{ background:var(--panel); padding:26px 24px 22px; position:relative; overflow:hidden; transition:background .2s; }}
+.role-card:hover {{ background:var(--panel-2); }}
+.role-card::before {{ content:""; position:absolute; left:0; top:0; bottom:0; width:3px; }}
+.rc-pm::before {{ background:var(--pm); }}
+.rc-worker::before {{ background:var(--worker); }}
+.rc-auditor::before {{ background:var(--auditor); }}
+.rc-redline::before {{ background:var(--redline); }}
+.rc-glyph {{ position:absolute; right:18px; top:20px; width:34px; height:34px; opacity:.9; }}
+.rc-glyph::before, .rc-glyph::after {{ content:""; position:absolute; }}
+/* PM: 分诊放射 */
+.rc-glyph-pm {{ border:1.5px solid var(--pm); border-radius:50%; }}
+.rc-glyph-pm::before {{ inset:9px; border:1.5px solid var(--pm); border-radius:50%; opacity:.5; }}
+.rc-glyph-pm::after {{ left:50%; top:50%; width:1.5px; height:11px; background:var(--pm); transform:translate(-50%,-50%); }}
+/* worker: 方括号工件 */
+.rc-glyph-worker {{ border:1.5px solid var(--worker); }}
+.rc-glyph-worker::before {{ left:6px; top:6px; right:6px; bottom:6px; border:1.5px dashed var(--worker); opacity:.55; }}
+/* auditor: 勾选/审 */
+.rc-glyph-auditor {{ border:1.5px solid var(--auditor); transform:rotate(45deg); }}
+.rc-glyph-auditor::before {{ left:50%; top:50%; width:1.5px; height:11px; background:var(--auditor); transform:translate(-50%,-50%); }}
+/* redline: 禁止 */
+.rc-glyph-redline {{ border:1.5px solid var(--redline); border-radius:50%; }}
+.rc-glyph-redline::before {{ left:-2px; top:50%; width:38px; height:1.5px; background:var(--redline); transform:translateY(-50%) rotate(45deg); }}
+.rc-head {{ display:flex; align-items:baseline; gap:10px; margin-bottom:14px; }}
+.rc-name {{ font-family:var(--mono); font-weight:700; font-size:1.05rem; }}
+.rc-pm .rc-name {{ color:var(--pm); }}
+.rc-worker .rc-name {{ color:var(--worker); }}
+.rc-auditor .rc-name {{ color:var(--auditor); }}
+.rc-redline .rc-name {{ color:var(--redline); }}
+.rc-sub {{ font-size:.8rem; color:var(--ink-3); }}
+.rc-desc {{ font-size:.92rem; color:var(--ink-2); line-height:1.8; min-height:5.4em; text-wrap:pretty; }}
+.rc-foot {{ margin-top:16px; padding-top:14px; border-top:1px solid var(--line-soft); display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }}
+.rc-count {{ font-family:var(--mono); font-weight:700; font-size:1.5rem; }}
+.rc-count-lbl {{ font-size:.74rem; color:var(--ink-3); }}
+.role-stat {{ width:100%; font-size:.76rem; color:var(--ink-3); font-family:var(--mono); margin-top:2px; }}
+.role-stat b {{ color:var(--ink-2); }}
+.role-stat-sub {{ color:var(--ink-3); }}
+
+/* ---------- pipeline ---------- */
+.pipe-wrap {{ border:1px solid var(--line); background:var(--panel); padding:30px 22px; overflow-x:auto; }}
+.pipe {{ display:flex; align-items:stretch; gap:6px; min-width:max-content; }}
+.pipe-node {{ display:flex; flex-direction:column; gap:7px; min-width:108px; }}
+.pipe-chip {{
+  font-family:var(--mono); font-weight:700; font-size:.92rem; text-align:center;
+  padding:11px 12px; border:1px solid var(--line); background:var(--bg);
+  position:relative;
+}}
+.pipe-sub {{ font-size:.7rem; color:var(--ink-3); text-align:center; line-height:1.4; padding:0 2px; }}
+.pn-io .pipe-chip {{ color:var(--ink-2); }}
+.pn-pm .pipe-chip {{ color:var(--pm); border-color:rgba(56,189,248,.35); }}
+.pn-worker .pipe-chip {{ color:var(--worker); border-color:rgba(52,211,153,.35); }}
+.pn-auditor .pipe-chip {{ color:var(--auditor); border-color:rgba(167,139,250,.35); }}
+.pn-human .pipe-chip {{ color:var(--human); border-color:var(--amber-dim); background:linear-gradient(180deg, rgba(240,180,41,.08), var(--bg)); }}
+.pipe-arrow {{ display:flex; align-items:center; color:var(--ink-3); padding-top:14px; flex:0 0 auto; }}
+.pipe-legend {{ margin-top:18px; font-size:.78rem; color:var(--ink-3); display:flex; gap:18px; flex-wrap:wrap; align-items:center; }}
+.pipe-legend .dot {{ display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }}
+.guard-note {{ margin-top:14px; font-size:.82rem; color:var(--ink-2); border-left:2px solid var(--redline); padding-left:12px; }}
+.guard-note b {{ color:var(--redline); }}
+
+/* ---------- redline ---------- */
+.red-top {{ display:grid; grid-template-columns:1.1fr 2fr; gap:1px; background:var(--line); border:1px solid var(--line); margin-bottom:24px; }}
+.red-summary {{ background:var(--panel); padding:28px 26px; }}
+.red-summary .big {{ font-family:var(--mono); font-weight:700; font-size:clamp(3rem,8vw,4.6rem); line-height:1; color:var(--redline); text-shadow:0 0 26px rgba(244,88,78,.3); }}
+.red-summary .big small {{ font-size:.26em; color:var(--ink-3); font-weight:500; margin-left:6px; }}
+.red-summary .cap {{ margin-top:14px; font-size:.86rem; color:var(--ink-2); line-height:1.7; }}
+.red-summary .sub {{ margin-top:10px; font-family:var(--mono); font-size:.74rem; color:var(--ink-3); }}
+.red-grid {{ background:var(--panel); padding:24px 26px; display:grid; grid-template-columns:repeat(2,1fr); gap:14px; align-content:center; }}
+.red-card {{ border:1px solid var(--line); padding:14px 16px; background:var(--bg); }}
+.red-card-top {{ display:flex; align-items:baseline; justify-content:space-between; gap:8px; }}
+.red-rule {{ font-family:var(--mono); font-size:.82rem; color:var(--ink); }}
+.red-cnt {{ font-family:var(--mono); font-weight:700; color:var(--redline); font-size:1.1rem; }}
+.red-cnt small {{ font-size:.6em; color:var(--ink-3); font-weight:400; margin-left:2px; }}
+.red-desc {{ margin-top:6px; font-size:.76rem; color:var(--ink-3); }}
+
+/* ---------- timeline / log ---------- */
+.legend {{ display:flex; gap:16px; flex-wrap:wrap; margin-bottom:22px; font-size:.78rem; color:var(--ink-2); font-family:var(--mono); }}
+.legend span {{ display:inline-flex; align-items:center; gap:7px; }}
+.legend i {{ width:9px; height:9px; border-radius:50%; display:inline-block; }}
+.log {{ border:1px solid var(--line); background:var(--panel); }}
+.day-sep {{ display:flex; align-items:center; gap:10px; padding:14px 20px; background:var(--bg); border-bottom:1px solid var(--line); position:sticky; top:54px; z-index:5; }}
+.day-dot {{ width:7px; height:7px; background:var(--amber); border-radius:50%; box-shadow:0 0 8px var(--amber); }}
+.day-lbl {{ font-family:var(--mono); font-size:.76rem; letter-spacing:.06em; color:var(--ink-2); }}
+.log-row {{ display:flex; gap:0; border-bottom:1px solid var(--line-soft); transition:background .15s; }}
+.log-row:last-child {{ border-bottom:0; }}
+.log-row:hover {{ background:var(--panel-2); }}
+.log-rail {{ flex:0 0 40px; display:flex; justify-content:center; padding-top:18px; position:relative; }}
+.log-rail::before {{ content:""; position:absolute; top:0; bottom:0; left:50%; width:1px; background:var(--line-soft); transform:translateX(-50%); }}
+.rail-dot {{ width:9px; height:9px; border-radius:50%; z-index:1; box-shadow:0 0 0 3px var(--panel); }}
+.log-row:hover .rail-dot {{ box-shadow:0 0 0 3px var(--panel-2); }}
+.rail-pm {{ background:var(--pm); }} .rail-worker {{ background:var(--worker); }}
+.rail-auditor {{ background:var(--auditor); }} .rail-redline {{ background:var(--redline); }}
+.log-body {{ flex:1; min-width:0; padding:14px 20px 14px 4px; }}
+.log-head {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:4px; }}
+.role-tag {{ font-family:var(--mono); font-size:.68rem; font-weight:700; letter-spacing:.06em; padding:2px 7px; border:1px solid; border-radius:2px; }}
+.role-pm {{ color:var(--pm); border-color:rgba(56,189,248,.4); }}
+.role-worker {{ color:var(--worker); border-color:rgba(52,211,153,.4); }}
+.role-auditor {{ color:var(--auditor); border-color:rgba(167,139,250,.4); }}
+.role-redline {{ color:var(--redline); border-color:rgba(244,88,78,.4); }}
+.log-time {{ font-family:var(--mono); font-size:.72rem; color:var(--ink-3); font-variant-numeric:tabular-nums; }}
+.log-meta {{ display:inline-flex; gap:6px; flex-wrap:wrap; }}
+.chip {{ font-family:var(--mono); font-size:.64rem; padding:2px 6px; border-radius:2px; letter-spacing:.04em; }}
+.chip-issue {{ color:var(--ink-2); background:var(--bg); border:1px solid var(--line); }}
+.chip-dur {{ color:var(--ink-3); background:var(--bg); border:1px solid var(--line); }}
+.chip-res {{ font-weight:700; }}
+.chip-ok {{ color:#062a1d; background:var(--ok); }}
+.chip-warn {{ color:#2e2200; background:var(--warn); }}
+.chip-deny, .chip-fail {{ color:#2a0606; background:var(--deny); }}
+.log-task {{ font-size:.92rem; color:var(--ink); line-height:1.6; word-break:break-word; text-wrap:pretty; }}
+.log-row[data-role="redline"] .log-task {{ font-family:var(--mono); font-size:.82rem; color:var(--ink-2); }}
+.files {{ margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; }}
+.filechip {{ font-family:var(--mono); font-size:.72rem; color:var(--worker); background:rgba(52,211,153,.08); border:1px solid rgba(52,211,153,.22); padding:2px 8px; border-radius:2px; }}
+
+/* filter */
+.filters {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:20px; }}
+.filters button {{
+  font-family:var(--mono); font-size:.74rem; color:var(--ink-2); background:var(--panel);
+  border:1px solid var(--line); padding:6px 13px; cursor:pointer; transition:all .15s; letter-spacing:.03em;
+}}
+.filters button:hover {{ border-color:var(--ink-3); color:var(--ink); }}
+.filters button.on {{ background:var(--amber); color:#0a0d11; border-color:var(--amber); font-weight:700; }}
+.filters button .c {{ opacity:.6; margin-left:5px; }}
+.filters button.on .c {{ opacity:.85; }}
+
+/* ---------- footer ---------- */
+footer {{ border-top:1px solid var(--line); padding:40px 0 70px; margin-top:30px; }}
+footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-between; align-items:flex-start; }}
+.foot-note {{ font-size:.82rem; color:var(--ink-3); line-height:1.8; max-width:54ch; }}
+.foot-note code {{ font-family:var(--mono); color:var(--ink-2); }}
+.foot-meta {{ font-family:var(--mono); font-size:.74rem; color:var(--ink-3); text-align:right; }}
+.foot-meta b {{ color:var(--amber); font-weight:600; }}
+.stack {{ margin-top:8px; font-size:.72rem; color:var(--ink-3); }}
+
+/* ---------- responsive ---------- */
+@media (max-width:880px) {{
+  .kpis {{ grid-template-columns:repeat(2,1fr); }}
+  .kpi:nth-child(2) {{ border-right:0; }}
+  .kpi:nth-child(1), .kpi:nth-child(2) {{ border-bottom:1px solid var(--line); }}
+  .roles {{ grid-template-columns:1fr; }}
+  .red-top {{ grid-template-columns:1fr; }}
+  .red-grid {{ grid-template-columns:1fr; }}
+}}
+@media (max-width:560px) {{
+  .wrap {{ padding:0 16px; }}
+  .hero {{ padding:52px 0 32px; }}
+  .kpis {{ grid-template-columns:1fr; }}
+  .kpi {{ border-right:0; border-bottom:1px solid var(--line); }}
+  .kpi:last-child {{ border-bottom:0; }}
+  .red-grid {{ grid-template-columns:1fr; }}
+  .topbar .upd {{ display:none; }}
+  .sec-head .sec-note {{ text-align:left; }}
+  .log-rail {{ flex:0 0 30px; }}
+  .day-sep {{ top:54px; }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+  .brand .sig {{ animation:none; }}
+  * {{ scroll-behavior:auto; }}
+}}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="wrap">
+    <span class="brand"><span class="sig" aria-hidden="true"></span>ARMY&nbsp;OPS<span class="live">DAILY&nbsp;SYNC</span></span>
+    <span class="spacer"></span>
+    <span class="upd">last sync · <b>{esc(gen_at)}</b> CST</span>
+  </div>
+</div>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="eyebrow">自治多 Agent 软件组织 · 作战日志</div>
+    <h1>一个自己<span class="em">分诊、改码、审查、合并</span>的 AI 军团。</h1>
+    <p class="lede">
+      人只做一件事：<b>在 IM 点「批准」</b>。其余全自动——
+      PM 分诊 GitHub Issue 并派工，Worker 建独立 worktree 改代码、跑测试、开 PR，
+      Auditor 只读审查给出裁决，<b>Redline 红线守卫</b>在工具调用前做确定性拦截。
+      底座是 Claude Code + Claude 订阅，跑在 WSL + systemd，每 15 分钟轮询，真 7×24。
+    </p>
+
+    <div class="kpis">
+      <div class="kpi accent">
+        <div class="n tnum">{closed_n}</div>
+        <div class="lbl">端到端闭环（真实 bug 自主修复并合并）</div>
+        <div class="meta">{esc(closed_list)}</div>
+      </div>
+      <div class="kpi">
+        <div class="n tnum">{sr_disp}<small>%</small></div>
+        <div class="lbl">作战成功率（PM·Worker·Auditor）</div>
+        <div class="meta">{stats["ok_n"]} / {stats["with_result_n"]} 条 result=ok</div>
+      </div>
+      <div class="kpi">
+        <div class="n tnum">{stats["redline_deny"]}</div>
+        <div class="lbl">红线确定性拦截</div>
+        <div class="meta">deny · 不依赖模型自觉</div>
+      </div>
+      <div class="kpi">
+        <div class="n tnum">{stats["total"]}</div>
+        <div class="lbl">总作战记录</div>
+        <div class="meta">{stats["active_days"]} 个活跃日</div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section class="block">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">01</span>
+      <h2>四个角色，各守一职</h2>
+      <span class="sec-note">职责互斥 · 权限最小化 · Worker 绝不碰 main</span>
+    </div>
+    <div class="roles">
+      {role_cards}
+    </div>
+  </div>
+</section>
+
+<section class="block">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">02</span>
+      <h2>自治闭环</h2>
+      <span class="sec-note">从一条 Issue 到一次合并，人只在审批处介入</span>
+    </div>
+    <div class="pipe-wrap">
+      <div class="pipe">
+        {pipe_html}
+      </div>
+    </div>
+    <div class="guard-note">
+      <b>Redline hook</b> 横跨整条流水线：每一次 Bash / Write / Edit 工具调用前先过红线匹配，
+      命中危险操作直接 <b>deny</b>——它不是流程中的一个节点，而是包裹所有节点的硬约束层。
+    </div>
+    <div class="pipe-legend">
+      <span><i style="background:var(--pm)"></i>PM</span>
+      <span><i style="background:var(--worker)"></i>Worker</span>
+      <span><i style="background:var(--auditor)"></i>Auditor</span>
+      <span><i style="background:var(--human)"></i>人工审批</span>
+      <span><i style="background:var(--io)"></i>系统动作</span>
+    </div>
+  </div>
+</section>
+
+<section class="block">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">03</span>
+      <h2>红线守卫</h2>
+      <span class="sec-note">PreToolUse · 确定性匹配 · deny 即终止</span>
+    </div>
+    <div class="red-top">
+      <div class="red-summary">
+        <div class="big tnum">{stats["redline_deny"]}<small>deny</small></div>
+        <div class="cap">危险操作在工具执行前被确定性拦截。这层守卫<b>不经过模型推理</b>——
+          匹配即拒绝，是组织放手自治的安全前提。</div>
+        <div class="sub">另有 {stats["redline_warn"]} 次 warn 级演练 / 告警</div>
+      </div>
+      <div class="red-grid">
+        {red_cards}
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="block">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">04</span>
+      <h2>作战时间线</h2>
+      <span class="sec-note">倒序 · 按角色染色 · 直接读自 runs.jsonl</span>
+    </div>
+    <div class="legend">
+      <span><i style="background:var(--pm)"></i>PM 分诊/派工</span>
+      <span><i style="background:var(--worker)"></i>Worker 开 PR</span>
+      <span><i style="background:var(--auditor)"></i>Auditor 审查</span>
+      <span><i style="background:var(--redline)"></i>Redline 拦截</span>
+    </div>
+    <div class="filters" id="filters">
+      <button data-f="all" class="on">全部<span class="c tnum">{stats["total"]}</span></button>
+      <button data-f="pm">PM<span class="c tnum">{rc.get("pm",0)}</span></button>
+      <button data-f="worker">Worker<span class="c tnum">{rc.get("worker",0)}</span></button>
+      <button data-f="auditor">Auditor<span class="c tnum">{rc.get("auditor",0)}</span></button>
+      <button data-f="redline">Redline<span class="c tnum">{rc.get("redline",0)}</span></button>
+    </div>
+    <div class="log" id="log">
+      {timeline_html}
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-note">
+      本页由 <code>army-dashboard</code> 脚本从运行账本 <code>runs.jsonl</code> 自动生成；
+      数据内联在 HTML 内，每次重跑即刷新。展示前已做脱敏处理——剔除了绝对路径、token 与 IP，
+      <code>task</code> 中的文件路径仅保留文件名。
+      <div class="stack">stack · Claude Code + Claude 订阅 · WSL + systemd timer（15min 轮询）· GitHub + IM 审批 bridge</div>
+    </div>
+    <div class="foot-meta">
+      数据跨度 · {esc(span_txt)}<br>
+      最后更新 · <b>{esc(gen_at)} CST</b><br>
+      {stats["total"]} 条记录 · {stats["active_days"]} 活跃日
+    </div>
+  </div>
+</footer>
+
+<script>
+// 时间线角色筛选（数据已内联，纯前端交互）
+(function(){{
+  var RUNS = {data_json};   // 脱敏后的完整记录（供调试 / 后续扩展）
+  var log = document.getElementById('log');
+  var btns = document.querySelectorAll('#filters button');
+  function apply(f){{
+    var rows = log.querySelectorAll('.log-row');
+    rows.forEach(function(r){{
+      r.style.display = (f==='all' || r.getAttribute('data-role')===f) ? '' : 'none';
+    }});
+    // 日期分隔：若该日全部隐藏则一并隐藏
+    var seps = log.querySelectorAll('.day-sep');
+    seps.forEach(function(sep){{
+      var anyVisible=false, el=sep.nextElementSibling;
+      while(el && !el.classList.contains('day-sep')){{
+        if(el.classList.contains('log-row') && el.style.display!=='none'){{anyVisible=true;break;}}
+        el=el.nextElementSibling;
+      }}
+      sep.style.display = anyVisible ? '' : 'none';
+    }});
+  }}
+  btns.forEach(function(b){{
+    b.addEventListener('click', function(){{
+      btns.forEach(function(x){{x.classList.remove('on');}});
+      b.classList.add('on');
+      apply(b.getAttribute('data-f'));
+    }});
+  }});
+}})();
+</script>
+</body>
+</html>
+"""
+
+
+def main() -> int:
+    raw = load_runs(LEDGER)
+    records = [c for c in (clean_record(r) for r in raw) if c]
+    stats = aggregate(records)
+
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(build_html(records, stats), encoding="utf-8")
+
+    # ---- 摘要 ----
+    print(f"[army-dashboard] 已生成：{OUT}")
+    print(f"  源账本           : {LEDGER}")
+    print(f"  总记录           : {stats['total']}（{stats['active_days']} 活跃日）")
+    rc = stats["role_counts"]
+    print(f"  角色分布         : pm={rc.get('pm',0)} worker={rc.get('worker',0)} "
+          f"auditor={rc.get('auditor',0)} redline={rc.get('redline',0)}")
+    print(f"  成功率           : {stats['success_rate']:.1f}%（{stats['ok_n']}/{stats['with_result_n']} result=ok）")
+    print(f"  Worker 累计耗时  : {fmt_dur(stats['worker_secs']) or '0s'}（{stats['pr_runs']} 个 PR）")
+    print(f"  红线拦截         : deny={stats['redline_deny']} warn={stats['redline_warn']}")
+    print(f"  端到端闭环       : {stats['closed_n']}（issues: {stats['closed_issues']}）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

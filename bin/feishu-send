@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""IM app-mode 发送器 —— 用自建应用 token 往群发文本/互动卡片（飞书）。
+
+凭据走 env 文件 `~/.army/im.env`（FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_CHAT_ID；不入 git）。
+对比 feishu-notify（自定义机器人 webhook，单向、无 token）：本脚本用 app token，
+能发互动卡片、指定 receive_id，是 feishu-bridge 审批卡片的发送侧。
+
+用法：
+    feishu-send "文本消息"                  # 发到默认群 FEISHU_CHAT_ID
+    feishu-send --chat <chat_id> "文本"      # 指定群
+    echo '<card json>' | feishu-send --card  # stdin 读互动卡片 JSON（msg_type=interactive）
+    feishu-send --card --file card.json
+退出码非 0 = 发送失败（凭据/权限/chat 错）。
+"""
+import sys, os, re, json, time, pathlib, urllib.request
+
+ENV = pathlib.Path(os.path.expanduser(os.environ.get("ARMY_IM_ENV", "~/.army/im.env")))
+BASE = "https://open.feishu.cn/open-apis"
+
+
+def _cells(row):
+    """拆一行 GFM 表格 → cell 列表（去掉首尾 | 造成的空串）。"""
+    parts = [c.strip() for c in row.strip().strip("|").split("|")]
+    return parts
+
+
+def _render_table(header_line, data_lines):
+    """GFM 表格 → 加粗列表（飞书 md 组件不渲染表格/代码块，拍平最稳）。
+    每数据行：`- **首列** — 表头2: 值2 · 表头3: 值3`。两列时简化为 `- **列1**: 列2`。"""
+    headers = _cells(header_line)
+    out = []
+    for dl in data_lines:
+        cells = _cells(dl)
+        if not cells or not any(cells):
+            continue
+        label = cells[0] or "—"
+        if len(cells) == 1:
+            out.append(f"- {label}")
+        elif len(cells) == 2:
+            out.append(f"- **{label}**: {cells[1]}")
+        else:
+            pairs = []
+            for j in range(1, len(cells)):
+                h = headers[j] if j < len(headers) else ""
+                pairs.append(f"{h}: {cells[j]}" if h else cells[j])
+            out.append(f"- **{label}** — " + " · ".join(pairs))
+    return "\n".join(out)
+
+
+def to_feishu_md(text):
+    """归一化 markdown 到飞书卡片 markdown 组件能渲染的子集：
+    `#` 标题 → 加粗（飞书不渲染 # 标题）；GFM 表格 → 加粗列表（飞书 md 不支持表格，也不渲染 ``` 代码块）。
+    加粗/无序·有序列表/链接/行内代码飞书原生支持，保留。"""
+    lines = text.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        l = lines[i]
+        m = re.match(r"^\s*(#{1,6})\s+(.*)$", l)
+        if m:
+            out.append(f"**{m.group(2).strip()}**")
+            i += 1
+            continue
+        # 表格块：本行含 | 且下一行是 |---|:--- 分隔行
+        if ("|" in l and i + 1 < len(lines)
+                and re.match(r"^\s*\|?[\s:|\-]+\|?\s*$", lines[i + 1]) and "-" in lines[i + 1]):
+            header_line = l
+            i += 2
+            data = []
+            while i < len(lines) and "|" in lines[i]:
+                data.append(lines[i])
+                i += 1
+            out.append(_render_table(header_line, data))
+            continue
+        out.append(l)
+        i += 1
+    return "\n".join(out)
+
+
+def md_card(text):
+    """文本 → 互动卡片（markdown 组件）。"""
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "elements": [{"tag": "markdown", "content": to_feishu_md(text)}],
+    }
+
+
+def load_env():
+    cfg = {}
+    if ENV.exists():
+        for line in ENV.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    for k in ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_CHAT_ID"):
+        if os.environ.get(k):
+            cfg[k] = os.environ[k]
+    return cfg
+
+
+def _post(url, body, headers=None):
+    h = {"Content-Type": "application/json; charset=utf-8"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=h)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode() or "{}")
+
+
+def tenant_token(cfg):
+    d = _post(f"{BASE}/auth/v3/tenant_access_token/internal",
+              {"app_id": cfg["FEISHU_APP_ID"], "app_secret": cfg["FEISHU_APP_SECRET"]})
+    if d.get("code") != 0:
+        raise RuntimeError(f"取 tenant_access_token 失败: {d}")
+    return d["tenant_access_token"]
+
+
+def send(cfg, chat_id, msg_type, content_obj):
+    token = tenant_token(cfg)
+    d = _post(f"{BASE}/im/v1/messages?receive_id_type=chat_id",
+              {"receive_id": chat_id, "msg_type": msg_type,
+               "content": json.dumps(content_obj, ensure_ascii=False)},
+              headers={"Authorization": f"Bearer {token}"})
+    return d
+
+
+def main():
+    args = sys.argv[1:]
+    chat = None
+    card = False
+    md = False
+    file = None
+    rest = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--chat":
+            chat = args[i + 1]; i += 2
+        elif a == "--card":
+            card = True; i += 1
+        elif a == "--md":
+            md = True; i += 1
+        elif a == "--file":
+            file = args[i + 1]; i += 2
+        else:
+            rest.append(a); i += 1
+
+    cfg = load_env()
+    if not cfg.get("FEISHU_APP_ID") or not cfg.get("FEISHU_APP_SECRET"):
+        print(f"feishu-send: 未配 app 凭据（{ENV}）", file=sys.stderr); sys.exit(2)
+    chat = chat or cfg.get("FEISHU_CHAT_ID")
+    if not chat:
+        print("feishu-send: 无 chat_id（--chat 或 FEISHU_CHAT_ID）", file=sys.stderr); sys.exit(2)
+
+    if card:
+        raw = pathlib.Path(file).read_text() if file else sys.stdin.read()
+        try:
+            content = json.loads(raw)
+        except Exception as e:
+            print(f"feishu-send: 卡片 JSON 解析失败 {e}", file=sys.stderr); sys.exit(2)
+        msg_type = "interactive"
+    elif md:
+        text = pathlib.Path(file).read_text() if file else (" ".join(rest).strip() or sys.stdin.read())
+        text = text.strip()
+        if not text:
+            print("feishu-send: 无消息内容", file=sys.stderr); sys.exit(2)
+        content = md_card(text)
+        msg_type = "interactive"
+    else:
+        text = " ".join(rest).strip() or sys.stdin.read().strip()
+        if not text:
+            print("feishu-send: 无消息内容", file=sys.stderr); sys.exit(2)
+        content = {"text": text}
+        msg_type = "text"
+
+    try:
+        d = send(cfg, chat, msg_type, content)
+    except Exception as e:
+        print(f"feishu-send: 发送异常 {e}", file=sys.stderr); sys.exit(1)
+    if d.get("code") != 0:
+        print(f"feishu-send: 返回错误 {d}", file=sys.stderr); sys.exit(1)
+    print(f"feishu-send: ok msg_id={d.get('data', {}).get('message_id', '?')}")
+
+
+if __name__ == "__main__":
+    main()
