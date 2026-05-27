@@ -4,6 +4,7 @@ runs.jsonl
 worktrees/
 log/
 .army-state
+.pm-session.json
 
 # 知识库 / 私有产物（操作者自己的独立 repo，不随本脚手架分发）
 docs-private/

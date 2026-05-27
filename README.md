@@ -17,6 +17,10 @@ Issue#1 ─worker(Opus,125s)─▶ PR#2 ─auditor(Sonnet,90s)─▶ LGTM ─IM�
 Issue#3 ─worker(Opus,289s)─▶ PR#4 ─auditor(Sonnet,121s)─▶ LGTM ─IM卡片─人批准─▶ merged
 ```
 
+上面第二行最后一拍在 IM 里长这样——Auditor 判 LGTM 后自动推一张审批卡片，人点「批准合并」，bridge 跑 `gh pr merge` 回执「已合并 PR#4」，PM 再流式汇报：
+
+![IM 审批卡片 → 人点批准 → 自动合并 → PM 流式回执](./docs/img/feishu-pm-approval.png)
+
 `runs.jsonl` 执行账本里的真实链路（脱敏样例见 [`runs.example.jsonl`](./runs.example.jsonl)）：一单从 `worker(含 files_touched)` → `auditor` → `pm 审批合并` 齐全；外加红线 hook 的拦截记录（`role=redline`，`deny`/`warn`）。
 
 > 这些数据每天由 [`bin/army-dashboard`](./bin/army-dashboard) 从账本生成一个自包含的「作战日志看板」HTML（脱敏后发布到站点），[`bin/army-dashboard-sync`](./bin/army-dashboard-sync) 按日历天节流推送。

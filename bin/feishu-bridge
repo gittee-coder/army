@@ -51,6 +51,7 @@ CARD_MIN_INTERVAL = 0.35  # 卡片刷新最小间隔（s），<10/s 上限且避
 
 _seen = set()                      # message_id 去重（IM 会重投）
 _session = {"id": None, "ts": 0.0}  # 单群 chat→session 映射；窗口内 follow-up resume 同一 session
+SESS_FILE = ARMY / ".pm-session.json"  # 落盘：bridge 重启后仍能在 1h 窗口内 --resume 同一 session，不白丢 cache
 RESUME_TTL = 3600                  # = 提示词 cache TTL(1h 扩展缓存)。窗口内同群追问复用 session 吃缓存，别用 5min/10min 白丢缓存
 
 
@@ -60,6 +61,25 @@ def log(m):
     with open(LOG, "a") as f:
         f.write(line + "\n")
     print(line, flush=True)
+
+
+def _load_session():
+    try:
+        d = json.loads(SESS_FILE.read_text())
+        _session["id"], _session["ts"] = d.get("id"), float(d.get("ts") or 0)
+        log(f"session restored: {(_session['id'] or '')[:8]} age={int(time.time()-_session['ts'])}s")
+    except Exception:
+        pass
+
+
+def _save_session():
+    try:
+        SESS_FILE.write_text(json.dumps(_session))
+    except Exception as e:
+        log(f"save session fail: {e}")
+
+
+_load_session()
 
 
 def paused():
@@ -212,6 +232,8 @@ def wake_pm(text):
     任何流式/卡片失败都回退到旧的纯文本 send，绝不丢回复。"""
     now = time.time()
     used_resume = bool(_session["id"] and now - _session["ts"] < RESUME_TTL)
+    resume_target = _session["id"] if used_resume else None
+    log(f"wake_pm: resume={'yes:'+resume_target[:8] if used_resume else 'no'} age={int(now-_session['ts'])}s")
     cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
            "--include-partial-messages",
            "--append-system-prompt", PM_ROLE.read_text(), "--model", "opus"]
@@ -255,6 +277,8 @@ def wake_pm(text):
                 ev = json.loads(line)
             except Exception:
                 continue
+            if not sid and ev.get("session_id"):    # init 事件就带 sid：即便本轮被 kill 也留得住，不丢链
+                sid = ev.get("session_id")
             et = ev.get("type")
             if et == "stream_event":                # token 级增量
                 e = ev.get("event", {})
@@ -286,7 +310,11 @@ def wake_pm(text):
         pt.join(timeout=2)                          # 等 pusher 收手，收尾 seq 不与其撞序
 
     if sid:
+        if used_resume and sid != resume_target:    # 该复用却拿回新 id → resume 断链（compact/被kill/锁），cache 丢了
+            log(f"wake_pm: RESUME BROKE target={resume_target[:8]} -> got={sid[:8]}（本轮 cache 未命中）")
         _session["id"], _session["ts"] = sid, now
+        _save_session()
+    log(f"wake_pm done: sid={(sid or '')[:8]} resumed={used_resume} rc={rc}")
     body = st["body"]
     if not body:
         body = f"PM 进程异常 rc={rc}" + (("：" + (j.get("result") or "")) if j else "")
