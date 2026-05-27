@@ -9,7 +9,7 @@ tags: [orchestration, pm, worker, auditor, state-machine]
 
 把所有设计决策拼成一张实现级状态机。**最小闭环 = 软件部门**：操作者拍一个 bug → PM 派 code worker → 开 PR → Auditor review → 人在 IM 审批合并。全程过 guard / ledger / 红线 hook。
 
-> 当前状态：最小闭环已端到端实跑（多个真实 bug 自主修复并合并）。dispatcher 已转 LIVE（systemd timer 15min 轮询），红线 hook 已切 ENFORCE，IM 双向桥常驻。media/research 画像、多 worker 并行、briefing 自动化深加工 = 后续。
+> 当前状态：最小闭环已端到端实跑（多个真实 bug 自主修复并合并）。dispatcher 已转 LIVE（systemd timer 15min 轮询），红线 hook 已切 ENFORCE，IM 双向桥常驻，每日 briefing（9:00）/日报（22:00）已挂 systemd timer。media/research 画像、多 worker 并行、briefing 深加工 = 后续。
 
 ---
 

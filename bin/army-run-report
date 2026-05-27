@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# 唤起 Auditor 出《今日日报》——每天 22:00 由 army-report.timer 触发。
+# 用法：army-run-report [YYYY-MM-DD]   （默认今天）
+#
+# Auditor allowlist 同 army-run-auditor（Bash/Read/Grep/Glob，只读，无 Edit/Write）；日报文件用 Bash 写。
+# 落盘到知识库 reports/YYYY/MM/DD.md（ARMY_DOCS_DIR，默认 ~/army/docs-private；幂等键=日期），摘要推 IM。
+set -euo pipefail
+[[ -n "${ARMY_TZ:-}" ]] && export TZ="$ARMY_TZ"   # 日期按操作者时区；默认随系统
+~/army/bin/army-guard || exit 0
+
+date_str="${1:-$(date +%F)}"
+year="${date_str%%-*}"; month="$(echo "$date_str" | cut -d- -f2)"; day="$(echo "$date_str" | cut -d- -f3)"
+docs_dir="${ARMY_DOCS_DIR:-$HOME/army/docs-private}"
+dir="$docs_dir/reports/$year/$month"
+file="$dir/$day.md"
+
+# gh 用其自身 auth；org 仓如需 org-scoped token，运行本脚本前 export GH_TOKEN。
+
+prompt="你是 Auditor，现在出《今日日报（$date_str）》。每日例行，自己把状态捞齐。
+
+1) 捞当天事实（只读）：\`grep '$date_str' ~/army/runs.jsonl\`（今天账本全部行：worker/auditor/pm/redline）。
+   需要时 \`gh pr list --repo <repo> --state merged\` 核对合并。repo 见 ~/army/projects.yaml。
+2) 写日报到 \`$file\`（先 \`mkdir -p $dir\`，Bash heredoc 写 markdown）。结构：
+   # 日报 · $date_str
+   ## 今日产出   —— 合并的 PR / worker 跑的任务（条目带耗时）
+   ## 审查情况   —— LGTM/CHANGES 各几次，有无打回
+   ## 红线事件   —— redline hook 的 deny/warn；没有写「无」
+   ## 待跟进     —— 悬而未决的；没有写「无」
+   幂等：$file 已存在就覆盖更新当天这份。只写账本里真有的，别编。
+3) 摘要推 IM（≤5 行）：\`~/army/bin/feishu-send --md \"**今日日报 · $date_str**\n<要点>\"\`。
+4) 记账本：\`~/army/bin/army-ledger --role auditor --result ok --task \"日报 $date_str\"\`。
+SoD 铁律：你【只读】——不改代码、不 merge PR。日报文件可写（这是 PERSIST）。"
+
+start=$(date +%s); cd ~/army
+set +e
+claude -p "$prompt" \
+  --append-system-prompt "$(cat ~/army/roles/auditor.md)" \
+  --permission-mode default \
+  --model sonnet \
+  --allowedTools Bash Read Grep Glob
+rc=$?; set -e
+echo "=== report done: rc=$rc dur=$(( $(date +%s) - start ))s file=$file ==="
+[[ -f "$file" ]] || echo "[warn] 日报文件未生成：$file（Auditor 可能没写）" >&2

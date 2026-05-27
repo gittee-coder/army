@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# 唤起 PM 出《今日 briefing》——每天 9:00 由 army-briefing.timer 触发（事件式：WAKE→REHYDRATE→PERSIST）。
+# 用法：army-run-briefing [YYYY-MM-DD]   （默认今天）
+#
+# PM allowlist 同 army-run-pm（Bash/Read/Grep/Glob，无 Edit/Write）；briefing 文件用 Bash 写，红线 hook 照常覆盖。
+# cwd=~/army 自动加载 CLAUDE.md；落盘到知识库 briefings/YYYY/MM/DD.md（ARMY_DOCS_DIR，默认 ~/army/docs-private），摘要推 IM。
+set -euo pipefail
+[[ -n "${ARMY_TZ:-}" ]] && export TZ="$ARMY_TZ"   # 日期按操作者时区；默认随系统
+~/army/bin/army-guard || exit 0
+
+date_str="${1:-$(date +%F)}"
+year="${date_str%%-*}"; month="$(echo "$date_str" | cut -d- -f2)"; day="$(echo "$date_str" | cut -d- -f3)"
+docs_dir="${ARMY_DOCS_DIR:-$HOME/army/docs-private}"
+dir="$docs_dir/briefings/$year/$month"
+file="$dir/$day.md"
+
+# gh 用其自身 auth；org 仓如需 org-scoped token，运行本脚本前 export GH_TOKEN。
+
+prompt="你是 PM，现在出《今日 briefing（$date_str）》。这是每日例行，无人触发，自己把状态捞齐。
+
+1) 捞状态（只读）：
+   - 读 ~/army/projects.yaml，对每个有 repo（非 null）的项目跑：
+     \`gh issue list --repo <repo> --state open --label auto-eligible\` 和 \`gh pr list --repo <repo> --state open\`。
+   - 读账本近况：\`grep '$date_str\|$(date -d "$date_str -1 day" +%F)' ~/army/runs.jsonl\`（昨日+今日已发生的事）。
+2) 写 briefing 到 \`$file\`（先 \`mkdir -p $dir\`，用 Bash heredoc 写 markdown）。结构：
+   # 今日 briefing · $date_str
+   ## 昨日完成      —— 从 ledger 摘（合并了哪些 PR / worker 跑了什么）
+   ## 今日在途/计划  —— 开着的 Issue/PR、我准备怎么推（口吻：「我准备这么干，除非你拦」）
+   ## 待你拍板       —— 等审批合并的 PR、任何 RED；没有就写「无」
+   ## 风险/阻塞      —— 没有就写「无」
+   只写事实，别编造没发生的事；某节为空就明说「无」。
+3) 摘要推 IM（≤6 行）：\`~/army/bin/feishu-send --md \"**今日 briefing · $date_str**\n<3~5 条要点>\"\`。
+4) 记账本：\`~/army/bin/army-ledger --role pm --result ok --task \"briefing $date_str\"\`。
+铁律：只读不改代码、不合并 PR（合并是人审批）。briefing 文件本身可写（这是 PERSIST）。"
+
+start=$(date +%s); cd ~/army
+set +e
+claude -p "$prompt" \
+  --append-system-prompt "$(cat ~/army/roles/pm.md)" \
+  --permission-mode default \
+  --model opus \
+  --allowedTools Bash Read Grep Glob
+rc=$?; set -e
+echo "=== briefing done: rc=$rc dur=$(( $(date +%s) - start ))s file=$file ==="
+[[ -f "$file" ]] || echo "[warn] briefing 文件未生成：$file（PM 可能没写）" >&2

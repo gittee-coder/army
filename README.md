@@ -129,7 +129,7 @@ ARMY_DISPATCH_LIVE=1 bin/army-dispatch      # 真自动唤起 PM / Auditor
 echo PAUSE > ~/.army-state                  # 总开关：一条命令停全军
 ```
 
-上 systemd 常驻（真 7×24）：把 `army-dispatch` 包成 timer（15min）、`feishu-bridge` 包成 service，开 `Linger=yes`，宿主电源不睡 + 开机自启即可。红线切真拦：worker 环境 `ARMY_REDLINE_ENFORCE=1`（`army-run-worker` 已默认）。
+上 systemd 常驻（真 7×24）：把 `army-dispatch` 包成 timer（15min）、`feishu-bridge` 包成 service，开 `Linger=yes`，宿主电源不睡 + 开机自启即可。再挂两个日历 timer 出每日例行——`army-run-briefing`（9:00 PM briefing）、`army-run-report`（22:00 Auditor 日报），写进知识库 + 摘要推 IM。红线切真拦：worker 环境 `ARMY_REDLINE_ENFORCE=1`（`army-run-worker` 已默认）。
 
 > 脚本默认以 `~/army` 为家。`gh` 用其自身认证；org 仓如需 org-scoped token，运行前 `export GH_TOKEN=...`。IM / 站点同步全走 env，无任何硬编码凭据或私有路径。
 
@@ -141,6 +141,8 @@ bin/
   army-run-pm          唤起 PM 分诊 + 派工
   army-run-worker      建 worktree + 起 worker + 注入红线 hook + 记 ledger
   army-run-auditor     唤起 Auditor 审 PR + VERDICT → 推审批卡片 / 打回
+  army-run-briefing    PM 每日《今日 briefing》（army-briefing.timer 9:00）→ 写知识库 + 推 IM
+  army-run-report      Auditor 每日日报（army-report.timer 22:00）→ 写知识库 + 推 IM
   army-redline-hook    红线 PreToolUse hook（LOG-ONLY / ENFORCE）
   army-guard           总开关（PAUSE 时 exit 3，调用方 skip）
   army-ledger          执行账本写入器（一行一事件）

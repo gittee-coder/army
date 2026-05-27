@@ -152,6 +152,16 @@ def main():
     if not chat:
         print("feishu-send: 无 chat_id（--chat 或 FEISHU_CHAT_ID）", file=sys.stderr); sys.exit(2)
 
+    def _arg_text():
+        # 文本来源：--file / CLI 参数 / stdin。CLI 参数里的字面量 \n \t 还原成真换行/制表——
+        # shell 双引号不解释转义，调用方（含 headless agent）常传字面 \n，不还原会被 IM 当明文打印。
+        # --file / stdin 已是真换行，不动。
+        if file:
+            return pathlib.Path(file).read_text()
+        if rest:
+            return " ".join(rest).replace("\\n", "\n").replace("\\t", "\t")
+        return sys.stdin.read()
+
     if card:
         raw = pathlib.Path(file).read_text() if file else sys.stdin.read()
         try:
@@ -160,14 +170,13 @@ def main():
             print(f"feishu-send: 卡片 JSON 解析失败 {e}", file=sys.stderr); sys.exit(2)
         msg_type = "interactive"
     elif md:
-        text = pathlib.Path(file).read_text() if file else (" ".join(rest).strip() or sys.stdin.read())
-        text = text.strip()
+        text = _arg_text().strip()
         if not text:
             print("feishu-send: 无消息内容", file=sys.stderr); sys.exit(2)
         content = md_card(text)
         msg_type = "interactive"
     else:
-        text = " ".join(rest).strip() or sys.stdin.read().strip()
+        text = _arg_text().strip()
         if not text:
             print("feishu-send: 无消息内容", file=sys.stderr); sys.exit(2)
         content = {"text": text}
