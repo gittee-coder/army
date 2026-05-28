@@ -74,6 +74,17 @@ def sanitize_text(s: str) -> str:
     return s
 
 
+# 操作者通过 IM 直接私聊 PM 的原文消息（例如 "feishu @PM: ..." / "slack @PM: ..."）
+# ——这部分包含临时想法、吐槽、未成稿决策，不适合对外公开；只保留"曾发生过对话"这个事实。
+_IM_CHAT = re.compile(r"^(?:feishu|slack|im|wechat|dm)\s+@\s*PM\s*[:：]\s*", re.IGNORECASE)
+
+
+def redact_im_chat(task: str) -> str:
+    if _IM_CHAT.match(task or ""):
+        return "[IM 私聊 · 内容不对外公开]"
+    return task
+
+
 def sanitize_files(files) -> list[str]:
     """files_touched 已是相对路径，但仍剔除任何意外的绝对路径/敏感串。"""
     out = []
@@ -120,7 +131,7 @@ def clean_record(rec: dict) -> dict | None:
     out = {
         "ts": ts if isinstance(ts, str) else None,
         "role": role,
-        "task": sanitize_text(str(rec.get("task", ""))),
+        "task": redact_im_chat(sanitize_text(str(rec.get("task", "")))),
     }
     if "issue" in rec and isinstance(rec["issue"], int):
         out["issue"] = rec["issue"]
@@ -545,8 +556,30 @@ body {{
 .kpi .lbl {{ margin-top:12px; font-size:.78rem; color:var(--ink-2); letter-spacing:.02em; }}
 .kpi .meta {{ margin-top:4px; font-family:var(--mono); font-size:.68rem; color:var(--ink-3); }}
 
+/* ---------- tab nav (sticky under topbar) ---------- */
+.tabnav {{
+  position:sticky; top:54px; z-index:49;
+  background:rgba(10,13,17,.86); backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--line);
+}}
+.tabnav .wrap {{ display:flex; gap:0; height:48px; align-items:stretch; overflow-x:auto; scrollbar-width:none; }}
+.tabnav .wrap::-webkit-scrollbar {{ display:none; }}
+.tabnav button {{
+  flex:0 0 auto; font-family:var(--mono); font-size:.78rem; letter-spacing:.06em;
+  background:transparent; border:0; color:var(--ink-2);
+  padding:0 20px; cursor:pointer; transition:color .15s, border-color .15s;
+  border-bottom:2px solid transparent; white-space:nowrap;
+}}
+.tabnav button:hover {{ color:var(--ink); }}
+.tabnav button.on {{ color:var(--amber); border-bottom-color:var(--amber); font-weight:700; }}
+.tabnav button .tnum {{ color:var(--ink-3); margin-left:6px; font-weight:500; }}
+.tabnav button.on .tnum {{ color:var(--amber-dim); }}
+.tab-panel {{ display:none; }}
+.tab-panel.on {{ display:block; }}
+
 /* ---------- section frame ---------- */
 section.block {{ padding:54px 0; border-top:1px solid var(--line-soft); }}
+section.block.tab-panel.on {{ border-top:0; }}
 .sec-head {{ display:flex; align-items:baseline; gap:14px; margin-bottom:30px; flex-wrap:wrap; }}
 .sec-num {{ font-family:var(--mono); font-size:.78rem; color:var(--amber); letter-spacing:.1em; }}
 .sec-head h2 {{ font-size:clamp(1.35rem,2.6vw,1.85rem); font-weight:750; letter-spacing:-0.01em; }}
@@ -632,7 +665,7 @@ section.block {{ padding:54px 0; border-top:1px solid var(--line-soft); }}
 .legend span {{ display:inline-flex; align-items:center; gap:7px; }}
 .legend i {{ width:9px; height:9px; border-radius:50%; display:inline-block; }}
 .log {{ border:1px solid var(--line); background:var(--panel); }}
-.day-sep {{ display:flex; align-items:center; gap:10px; padding:14px 20px; background:var(--bg); border-bottom:1px solid var(--line); position:sticky; top:54px; z-index:5; }}
+.day-sep {{ display:flex; align-items:center; gap:10px; padding:14px 20px; background:var(--bg); border-bottom:1px solid var(--line); position:sticky; top:102px; z-index:5; }}
 .day-dot {{ width:7px; height:7px; background:var(--amber); border-radius:50%; box-shadow:0 0 8px var(--amber); }}
 .day-lbl {{ font-family:var(--mono); font-size:.76rem; letter-spacing:.06em; color:var(--ink-2); }}
 .log-row {{ display:flex; gap:0; border-bottom:1px solid var(--line-soft); transition:background .15s; }}
@@ -704,7 +737,8 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
   .topbar .upd {{ display:none; }}
   .sec-head .sec-note {{ text-align:left; }}
   .log-rail {{ flex:0 0 30px; }}
-  .day-sep {{ top:54px; }}
+  .day-sep {{ top:102px; }}
+  .tabnav button {{ padding:0 14px; font-size:.72rem; }}
 }}
 @media (prefers-reduced-motion: reduce) {{
   .brand .sig {{ animation:none; }}
@@ -721,6 +755,15 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
     <span class="upd">last sync · <b>{esc(gen_at)}</b> CST</span>
   </div>
 </div>
+
+<nav class="tabnav" id="tabnav">
+  <div class="wrap">
+    <button class="on" data-tab="roles">角色</button>
+    <button data-tab="loop">闭环</button>
+    <button data-tab="redline">红线<span class="tnum">{stats["redline_deny"]}</span></button>
+    <button data-tab="timeline">时间线<span class="tnum">{stats["total"]}</span></button>
+  </div>
+</nav>
 
 <header class="hero">
   <div class="wrap">
@@ -758,7 +801,7 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
   </div>
 </header>
 
-<section class="block">
+<section class="block tab-panel on" data-tab="roles">
   <div class="wrap">
     <div class="sec-head">
       <span class="sec-num">01</span>
@@ -771,7 +814,7 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
   </div>
 </section>
 
-<section class="block">
+<section class="block tab-panel" data-tab="loop">
   <div class="wrap">
     <div class="sec-head">
       <span class="sec-num">02</span>
@@ -797,7 +840,7 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
   </div>
 </section>
 
-<section class="block">
+<section class="block tab-panel" data-tab="redline">
   <div class="wrap">
     <div class="sec-head">
       <span class="sec-num">03</span>
@@ -818,7 +861,7 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
   </div>
 </section>
 
-<section class="block">
+<section class="block tab-panel" data-tab="timeline">
   <div class="wrap">
     <div class="sec-head">
       <span class="sec-num">04</span>
@@ -849,7 +892,8 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
     <div class="foot-note">
       本页由 <code>army-dashboard</code> 脚本从运行账本 <code>runs.jsonl</code> 自动生成；
       数据内联在 HTML 内，每次重跑即刷新。展示前已做脱敏处理——剔除了绝对路径、token 与 IP，
-      <code>task</code> 中的文件路径仅保留文件名。
+      <code>task</code> 中的文件路径仅保留文件名；操作者与 PM 的 IM 私聊原文不对外公开，
+      仅以占位符体现存在性。
       <div class="stack">stack · Claude Code + Claude 订阅 · WSL + systemd timer（15min 轮询）· GitHub + IM 审批 bridge</div>
     </div>
     <div class="foot-meta">
@@ -861,6 +905,36 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
 </footer>
 
 <script>
+// 顶部 tab 切换：默认 roles；hash 同步以便分享深链
+(function(){{
+  var nav = document.querySelectorAll('#tabnav button');
+  var panels = document.querySelectorAll('.tab-panel');
+  function show(t){{
+    var ok = false;
+    nav.forEach(function(b){{
+      var on = b.getAttribute('data-tab')===t;
+      b.classList.toggle('on', on);
+      if (on) ok = true;
+    }});
+    if (!ok) {{ t = 'roles'; nav[0] && nav[0].classList.add('on'); }}
+    panels.forEach(function(p){{ p.classList.toggle('on', p.getAttribute('data-tab')===t); }});
+    if (location.hash.replace('#','') !== t) {{
+      history.replaceState(null, '', '#'+t);
+    }}
+  }}
+  nav.forEach(function(b){{
+    b.addEventListener('click', function(){{
+      show(b.getAttribute('data-tab'));
+      window.scrollTo({{top:0,behavior:'instant'}});
+    }});
+  }});
+  var initial = (location.hash||'').replace('#','') || 'roles';
+  show(initial);
+  window.addEventListener('hashchange', function(){{
+    show((location.hash||'').replace('#','') || 'roles');
+  }});
+}})();
+
 // 时间线角色筛选（数据已内联，纯前端交互）
 (function(){{
   var RUNS = {data_json};   // 脱敏后的完整记录（供调试 / 后续扩展）

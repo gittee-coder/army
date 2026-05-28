@@ -26,5 +26,11 @@
 - 只在【具体项目路径】里干活，别拿一堆项目并列的根目录当工作路径（不在那种根上跑 git）
 - worker 永远 `--cwd <项目路径>`（自动加载该项目自己的 CLAUDE.md）
 
+## 对外发布铁律（army-ops 看板 / 你的站点仓）
+- `runs.jsonl` 中 **`(feishu|slack|im|wechat|dm) @PM:` 开头的 IM 私聊原文，永不出现在对外页面**
+  ——由 `bin/army-dashboard::redact_im_chat` 统一替换为 `[IM 私聊 · 内容不对外公开]`，只留存在性。
+- IM 中别写敏感内容（前提假设：发了就当公开），但脚本是兜底防线，不要拆。
+- 新增"会被推到对外站点仓"的字段前，先回到 `army-dashboard::clean_record` 加白名单；默认 deny。
+
 ## 上下文经济
 事件式、状态外置、Worker 默认串行吃 cache。干完即 PERSIST 写回事实源，session 可弃。
