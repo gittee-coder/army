@@ -758,14 +758,15 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
 
 <nav class="tabnav" id="tabnav">
   <div class="wrap">
-    <button class="on" data-tab="roles">角色</button>
+    <button class="on" data-tab="intro">介绍</button>
+    <button data-tab="roles">角色</button>
     <button data-tab="loop">闭环</button>
     <button data-tab="redline">红线<span class="tnum">{stats["redline_deny"]}</span></button>
     <button data-tab="timeline">时间线<span class="tnum">{stats["total"]}</span></button>
   </div>
 </nav>
 
-<header class="hero">
+<header class="hero tab-panel on" data-tab="intro">
   <div class="wrap">
     <div class="eyebrow">自治多 Agent 软件组织 · 作战日志</div>
     <h1>一个自己<span class="em">分诊、改码、审查、合并</span>的 AI 军团。</h1>
@@ -801,7 +802,7 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
   </div>
 </header>
 
-<section class="block tab-panel on" data-tab="roles">
+<section class="block tab-panel" data-tab="roles">
   <div class="wrap">
     <div class="sec-head">
       <span class="sec-num">01</span>
@@ -916,7 +917,7 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
       b.classList.toggle('on', on);
       if (on) ok = true;
     }});
-    if (!ok) {{ t = 'roles'; nav[0] && nav[0].classList.add('on'); }}
+    if (!ok) {{ t = 'intro'; nav[0] && nav[0].classList.add('on'); }}
     panels.forEach(function(p){{ p.classList.toggle('on', p.getAttribute('data-tab')===t); }});
     if (location.hash.replace('#','') !== t) {{
       history.replaceState(null, '', '#'+t);
@@ -928,10 +929,10 @@ footer .wrap {{ display:flex; flex-wrap:wrap; gap:20px; justify-content:space-be
       window.scrollTo({{top:0,behavior:'instant'}});
     }});
   }});
-  var initial = (location.hash||'').replace('#','') || 'roles';
+  var initial = (location.hash||'').replace('#','') || 'intro';
   show(initial);
   window.addEventListener('hashchange', function(){{
-    show((location.hash||'').replace('#','') || 'roles');
+    show((location.hash||'').replace('#','') || 'intro');
   }});
 }})();
 
